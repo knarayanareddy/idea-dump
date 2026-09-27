@@ -1,0 +1,236 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Idea Dump • Autonomous Engineering Pipeline</title>
+  <meta name="description" content="High-volume idea dump and daily autonomous repo factory powered by Hermes, Cline & Supabase." />
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="styles.css" />
+  <!-- Supabase JS Client via CDN -->
+  <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+</head>
+<body>
+  <!-- Ambient background glow layers -->
+  <div class="ambient-glow glow-1"></div>
+  <div class="ambient-glow glow-2"></div>
+
+  <div class="app-layout">
+    <!-- Header -->
+    <header class="app-header">
+      <div class="brand">
+        <div class="brand-icon">
+          <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+            <polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"></polygon>
+          </svg>
+        </div>
+        <div>
+          <h1 class="brand-title">Idea Dump <span class="badge-pipeline">Daily Pipeline</span></h1>
+          <p class="brand-subtitle">Stream raw thoughts • Hermes &amp; Cline synthesize &amp; build daily</p>
+        </div>
+      </div>
+
+      <div class="header-actions">
+        <div id="connection-status" class="status-indicator status-demo" title="Supabase connection status">
+          <span class="status-dot"></span>
+          <span id="connection-label">Demo Mode (Local)</span>
+        </div>
+        <button id="open-config-btn" class="btn btn-secondary btn-icon" title="Configure Supabase API Keys">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M12.22 2h-.44a2 2 0 0 0-2 2v.18a2 2 0 0 1-1 1.73l-.43.25a2 2 0 0 1-2 0l-.15-.08a2 2 0 0 0-2.73.73l-.22.38a2 2 0 0 0 .73 2.73l.15.1a2 2 0 0 1 1 1.72v.51a2 2 0 0 1-1 1.74l-.15.09a2 2 0 0 0-.73 2.73l.22.38a2 2 0 0 0 2.73.73l.15-.08a2 2 0 0 1 2 0l.43.25a2 2 0 0 1 1 1.73V20a2 2 0 0 0 2 2h.44a2 2 0 0 0 2-2v-.18a2 2 0 0 1 1-1.73l.43-.25a2 2 0 0 1 2 0l.15.08a2 2 0 0 0 2.73-.73l.22-.39a2 2 0 0 0-.73-2.73l-.15-.08a2 2 0 0 1-1-1.74v-.5a2 2 0 0 1 1-1.74l.15-.09a2 2 0 0 0 .73-2.73l-.22-.38a2 2 0 0 0-2.73-.73l-.15.08a2 2 0 0 1-2 0l-.43-.25a2 2 0 0 1-1-1.73V4a2 2 0 0 0-2-2z"></path>
+            <circle cx="12" cy="12" r="3"></circle>
+          </svg>
+          <span>Connect DB</span>
+        </button>
+      </div>
+    </header>
+
+    <!-- Metrics Bar -->
+    <section class="metrics-grid">
+      <div class="metric-card">
+        <span class="metric-label">Total Ideas</span>
+        <span id="stat-total" class="metric-value">0</span>
+        <span class="metric-sub">Dumped into stream</span>
+      </div>
+      <div class="metric-card highlight-cyan">
+        <span class="metric-label">Pending for Hermes</span>
+        <span id="stat-pending" class="metric-value">0</span>
+        <span class="metric-sub">Awaiting morning cron</span>
+      </div>
+      <div class="metric-card highlight-green">
+        <span class="metric-label">Projects Built</span>
+        <span id="stat-built" class="metric-value">0</span>
+        <span class="metric-sub">GitHub repos shipped</span>
+      </div>
+      <div class="metric-card">
+        <span class="metric-label">Build Frequency</span>
+        <span class="metric-value">1 / Day</span>
+        <span class="metric-sub">Hermes + Cline target</span>
+      </div>
+    </section>
+
+    <!-- Ingestion Engine: Dump Idea Card -->
+    <section class="dump-panel">
+      <div class="dump-card">
+        <div class="dump-card-header">
+          <div class="tab-pill">
+            <span class="pulse-dot"></span>
+            <span>Fast Ingestion</span>
+          </div>
+          <span class="shortcut-tip">Press <kbd>⌘</kbd> + <kbd>Enter</kbd> to dump</span>
+        </div>
+
+        <form id="idea-form" class="dump-form">
+          <div class="input-row">
+            <input 
+              type="text" 
+              id="idea-title" 
+              class="form-input title-input" 
+              placeholder="Idea title or topic (e.g. Scrapling Market Price Watcher)..." 
+              autocomplete="off"
+            />
+            <div class="priority-select-wrapper">
+              <select id="idea-priority" class="form-select">
+                <option value="normal">Normal Priority</option>
+                <option value="high">High Priority</option>
+                <option value="urgent">Urgent</option>
+                <option value="low">Low Priority</option>
+              </select>
+            </div>
+          </div>
+
+          <div class="textarea-wrapper">
+            <textarea 
+              id="idea-content" 
+              class="form-textarea" 
+              rows="4" 
+              placeholder="Dump anything: vague concepts, features to merge, APIs to test, architecture thoughts, problem statements..." 
+              required
+            ></textarea>
+          </div>
+
+          <!-- URL Inputs & Chips -->
+          <div class="link-entry-group">
+            <div class="link-input-row">
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="input-icon">
+                <path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"></path>
+                <path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"></path>
+              </svg>
+              <input 
+                type="url" 
+                id="link-input" 
+                class="form-input link-input" 
+                placeholder="Attach URLs, GitHub repos, tweets, documentation (press Enter)..." 
+              />
+              <button type="button" id="add-link-btn" class="btn btn-secondary btn-sm">Add Link</button>
+            </div>
+            <div id="url-chips" class="chips-container"></div>
+          </div>
+
+          <!-- Tags Quick Selector -->
+          <div class="tag-selector-group">
+            <span class="tag-label">Quick Tags:</span>
+            <div class="tag-chips">
+              <button type="button" class="tag-chip" data-tag="automation">+ automation</button>
+              <button type="button" class="tag-chip" data-tag="scraping">+ scraping</button>
+              <button type="button" class="tag-chip" data-tag="agent-tools">+ agent-tools</button>
+              <button type="button" class="tag-chip" data-tag="cli">+ cli</button>
+              <button type="button" class="tag-chip" data-tag="fastapi">+ fastapi</button>
+              <button type="button" class="tag-chip" data-tag="database">+ database</button>
+              <button type="button" class="tag-chip" data-tag="frontend">+ frontend</button>
+              <input type="text" id="custom-tag-input" class="tag-custom-input" placeholder="+ custom tag" />
+            </div>
+            <div id="active-tags" class="chips-container"></div>
+          </div>
+
+          <div class="dump-footer">
+            <span id="form-message" class="form-feedback"></span>
+            <button type="submit" id="submit-idea-btn" class="btn btn-primary">
+              <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+                <line x1="22" y1="2" x2="11" y2="13"></line>
+                <polygon points="22 2 15 22 11 13 2 9 22 2"></polygon>
+              </svg>
+              <span>Dump Idea into Stream</span>
+            </button>
+          </div>
+        </form>
+      </div>
+    </section>
+
+    <!-- Stream & Pipeline Section -->
+    <main class="stream-section">
+      <div class="stream-header">
+        <div class="stream-title-group">
+          <h2 class="section-title">Pipeline Stream</h2>
+          <span id="filtered-count" class="badge-count">0 items</span>
+        </div>
+
+        <!-- Filter tabs -->
+        <div class="filter-controls">
+          <div class="search-box">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <circle cx="11" cy="11" r="8"></circle>
+              <line x1="21" y1="21" x2="16.65" y2="16.65"></line>
+            </svg>
+            <input type="text" id="search-input" placeholder="Search ideas, URLs, tags..." />
+          </div>
+
+          <div class="filter-tabs">
+            <button class="filter-tab active" data-filter="all">All</button>
+            <button class="filter-tab" data-filter="pending">Pending</button>
+            <button class="filter-tab" data-filter="researching">Researching</button>
+            <button class="filter-tab" data-filter="built">Built (Repos)</button>
+            <button class="filter-tab" data-filter="archived">Archived</button>
+          </div>
+        </div>
+      </div>
+
+      <!-- Feed Container -->
+      <div id="ideas-feed" class="ideas-feed-grid">
+        <div class="loading-state">
+          <div class="spinner"></div>
+          <span>Synchronizing ideas stream...</span>
+        </div>
+      </div>
+    </main>
+
+    <!-- Supabase Configuration Modal -->
+    <div id="config-modal" class="modal-backdrop hidden">
+      <div class="modal-card">
+        <div class="modal-header">
+          <h3 class="modal-title">Supabase Database Connection</h3>
+          <button id="close-modal-btn" class="btn-close">&times;</button>
+        </div>
+        <p class="modal-desc">
+          Paste your free Supabase project URL and anon public key. Your keys are stored locally in your browser's <code>localStorage</code> and never sent anywhere else.
+        </p>
+        <div class="modal-body">
+          <label class="modal-label" for="supabase-url-input">Project URL</label>
+          <input type="text" id="supabase-url-input" class="form-input" placeholder="https://xyzcompany.supabase.co" />
+
+          <label class="modal-label" for="supabase-key-input">Anon Public Key</label>
+          <input type="password" id="supabase-key-input" class="form-input" placeholder="eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9..." />
+
+          <div class="modal-note">
+            <p><strong>Haven't set up Supabase yet?</strong></p>
+            <p>1. Create a free project at <a href="https://supabase.com" target="_blank" rel="noopener">supabase.com</a></p>
+            <p>2. Run the provided <code>schema.sql</code> in the Supabase SQL Editor</p>
+            <p>3. Grab your API credentials from Project Settings &gt; API</p>
+          </div>
+        </div>
+        <div class="modal-footer">
+          <button id="clear-config-btn" class="btn btn-secondary">Switch to Demo Mode</button>
+          <button id="save-config-btn" class="btn btn-primary">Save &amp; Connect</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Toast Notification Container -->
+    <div id="toast-container" class="toast-container"></div>
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>
