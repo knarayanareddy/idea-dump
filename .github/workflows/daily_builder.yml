@@ -1,0 +1,98 @@
+name: Autonomous Daily Idea Builder
+
+on:
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Dry run (generate specs locally, don't create GitHub repo or update Supabase)"
+        type: boolean
+        required: false
+        default: false
+      limit:
+        description: "Number of ideas to process (default: 1)"
+        type: string
+        required: false
+        default: "1"
+      idea_id:
+        description: "Specific Idea ID to build (leave blank for next pending idea)"
+        type: string
+        required: false
+        default: ""
+  schedule:
+    # Runs daily at 09:00 UTC (11:00 AM CEST)
+    - cron: '0 9 * * *'
+
+jobs:
+  build:
+    name: Execute Daily Idea Builder
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+
+    steps:
+      - name: Checkout Idea Dump Repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Authenticate GitHub CLI & Git
+        env:
+          GH_PAT: ${{ secrets.GH_PAT }}
+        run: |
+          echo "$GH_PAT" | gh auth login --with-token
+          git config --global user.name "Autonomous Daily Builder"
+          git config --global user.email "autonomous-builder@local.dev"
+          gh auth status
+
+      - name: Run Daily Builder Pipeline
+        id: run_builder
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_ANON_KEY: ${{ secrets.SUPABASE_ANON_KEY }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          GH_TOKEN: ${{ secrets.GH_PAT }}
+          GITHUB_TOKEN: ${{ secrets.GH_PAT }}
+        run: |
+          EXTRA_ARGS=""
+          if [ "${{ github.event.inputs.dry_run }}" = "true" ]; then
+            EXTRA_ARGS="$EXTRA_ARGS --dry-run"
+          fi
+          if [ -n "${{ github.event.inputs.idea_id }}" ]; then
+            EXTRA_ARGS="$EXTRA_ARGS --idea-id ${{ github.event.inputs.idea_id }}"
+          fi
+          LIMIT="${{ github.event.inputs.limit || '1' }}"
+
+          echo "Starting daily_builder with limit=$LIMIT, extra_args=$EXTRA_ARGS..."
+          python3 daily_builder.py --limit "$LIMIT" $EXTRA_ARGS 2>&1 | tee run.log
+
+      - name: Notify Telegram on Result
+        if: always()
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          JOB_STATUS: ${{ job.status }}
+        run: |
+          if [ -n "$TELEGRAM_BOT_TOKEN" ] && [ -n "$TELEGRAM_CHAT_ID" ]; then
+            ICON="✅"
+            if [ "$JOB_STATUS" != "success" ]; then
+              ICON="❌"
+            fi
+            
+            SUMMARY=$(tail -n 12 run.log 2>/dev/null || echo "No run log captured.")
+            # Escape HTML characters
+            SUMMARY_CLEAN=$(echo "$SUMMARY" | sed 's/&/\&amp;/g; s/</\&lt;/g; s/>/\&gt;/g')
+
+            MESSAGE="${ICON} <b>GitHub Actions: Daily Builder</b>%0A"
+            MESSAGE="${MESSAGE}<b>Status:</b> ${JOB_STATUS}%0A"
+            MESSAGE="${MESSAGE}<b>Trigger:</b> ${{ github.event_name }}%0A%0A"
+            MESSAGE="${MESSAGE}<pre>${SUMMARY_CLEAN}</pre>"
+
+            curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+              -d chat_id="${TELEGRAM_CHAT_ID}" \
+              -d parse_mode="HTML" \
+              -d text="$MESSAGE" || true
+          fi

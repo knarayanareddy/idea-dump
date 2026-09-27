@@ -79,3 +79,40 @@ The app runs immediately in **Demo Mode (Local Storage)**. You can dump ideas, a
 * **`ideas`**: Stores every raw entry with auto-computed `day_of_week`, extracted `urls`, `tags`, and pipeline status (`pending`, `researching`, `spec_ready`, `built`, `archived`).
 * **`projects`**: Tracks the GitHub repositories created daily by Hermes & Cline, linking back to `source_idea_ids`.
 * **RLS Policies**: Fully configured so your static `github.io` page can read and insert safely using the public anon key without backend servers.
+
+---
+
+## 5. Hackathon Idea Ingestion (`ingest_hackathon_ideas.py`)
+
+Seeds the `ideas` table with real, award-winning hackathon projects so the daily
+builder always has a deep backlog of `status = 'pending'` work.
+
+```bash
+python3 ingest_hackathon_ideas.py --check-only     # credentials + connectivity
+python3 ingest_hackathon_ideas.py --dry-run        # harvest + dedupe, no writes
+python3 ingest_hackathon_ideas.py --harvest-only   # build staging JSON only
+python3 ingest_hackathon_ideas.py --staging-only   # insert from staging JSON
+python3 ingest_hackathon_ideas.py --repair-titles  # upgrade weak titles in place
+python3 ingest_hackathon_ideas.py --verify-only    # print table counts
+```
+
+**Sources.** `devpost.com` is behind bot protection (HTTP 403 / DataDome) and
+`ethglobal.com` is a client-rendered SPA, so neither is scraped directly.
+Instead the pipeline harvests the public source repositories those projects
+publish, using the `ethglobal` and `devpost` topics plus a curated winner
+archive (`unicorn-mafia/awesome-hackathon-winners`). 1,277 candidate
+repositories are discovered; the top 150 by signal are enriched and inserted.
+
+**No invented data.** Every field is derived from real harvested GitHub
+metadata and the projects' own READMEs — names, URLs, descriptions, feature
+bullets, detected stack and verbatim award mentions. `raw_content` is a
+deterministically composed briefing (problem, architecture, features, novelty,
+validation) built from those real signals.
+
+**Controls.** Credentials are read strictly from `~/.hermes/idea-dump/keys.env`.
+Rows are deduplicated against both the staging set and the live table on
+normalized title *and* URL overlap, then inserted in batches of 25 via
+`POST /rest/v1/ideas` with `Prefer: return=minimal,count=exact`, with
+exponential backoff on 429/5xx and network errors. The staging artifact is
+written to `scratch/hackathon_ideas_150.json`; logs go to
+`~/.hermes/idea-dump/log/ingest.log`.

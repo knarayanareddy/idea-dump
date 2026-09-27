@@ -525,6 +525,7 @@ def main():
     parser.add_argument("--limit", type=int, default=1, help="Maximum number of ideas to process per run (default: 1).")
     parser.add_argument("--idea-id", type=int, default=None, help="Target a specific idea ID directly.")
     parser.add_argument("--check-only", action="store_true", help="Test database connection, pause state, and GitHub auth, then exit.")
+    parser.add_argument("--count-pending", action="store_true", help="Count remaining pending ideas in Supabase and exit.")
     parser.add_argument("--max-stale-minutes", type=int, default=None, help="Skip ideas queued longer than max minutes (useful after Mac wake).")
     parser.add_argument("-v", "--verbose", action="store_true", help="Enable verbose debug logging.")
 
@@ -534,25 +535,37 @@ def main():
     # 1. Concurrency lock
     with ConcurrencyLock(LOCK_FILE, logger):
         # 2. Pause check
-        if check_pause_state(logger):
+        if not args.count_pending and check_pause_state(logger):
             return 0
 
-        # 3. Load credentials strictly from keys.env
-        if not KEYS_FILE.exists():
-            logger.error(f"Configuration file {KEYS_FILE} not found.")
-            return 1
-        env_vars = load_env_file(KEYS_FILE)
+        # 3. Load credentials from keys.env or environment variables (e.g. CI/GitHub Actions)
+        env_vars = dict(os.environ)
+        if KEYS_FILE.exists():
+            env_vars.update(load_env_file(KEYS_FILE))
 
         # 4. Check-only mode
         if args.check_only:
             return run_check_only(logger, env_vars)
 
-        # 5. Normal or Dry-run execution
         supabase_url = env_vars.get("SUPABASE_URL")
         supabase_key = env_vars.get("SUPABASE_SERVICE_ROLE_KEY") or env_vars.get("SUPABASE_ANON_KEY")
         if not supabase_url or not supabase_key:
             logger.error("Missing SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY / SUPABASE_ANON_KEY.")
             return 1
+
+        client = SupabaseClient(supabase_url, supabase_key)
+
+        if args.count_pending:
+            try:
+                pending_ideas = client.get("ideas", {"select": "id", "status": "eq.pending"})
+                count = len(pending_ideas) if pending_ideas else 0
+                print(f"Total pending ideas in Idea Dump: {count}")
+                return 0
+            except Exception as e:
+                logger.error(f"Failed to query pending ideas count: {e}")
+                return 1
+
+        # 5. Normal or Dry-run execution
 
         # Check GitHub CLI auth if not in dry-run
         if not args.dry_run:
