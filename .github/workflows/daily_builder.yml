@@ -82,17 +82,37 @@ jobs:
               ICON="❌"
             fi
             
-            SUMMARY=$(tail -n 12 run.log 2>/dev/null || echo "No run log captured.")
-            # Escape HTML characters
-            SUMMARY_CLEAN=$(echo "$SUMMARY" | sed 's/&/\&amp;/g; s/</\&lt;/g; s/>/\&gt;/g')
+            SUMMARY=$(tail -n 8 run.log 2>/dev/null || echo "No run log.")
+            TEXT="${ICON} *GitHub Actions: Daily Builder*
+*Status:* ${JOB_STATUS}
+*Trigger:* ${{ github.event_name }}
 
-            MESSAGE="${ICON} <b>GitHub Actions: Daily Builder</b>%0A"
-            MESSAGE="${MESSAGE}<b>Status:</b> ${JOB_STATUS}%0A"
-            MESSAGE="${MESSAGE}<b>Trigger:</b> ${{ github.event_name }}%0A%0A"
-            MESSAGE="${MESSAGE}<pre>${SUMMARY_CLEAN}</pre>"
+\`\`\`
+${SUMMARY}
+\`\`\`"
 
-            curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
-              -d chat_id="${TELEGRAM_CHAT_ID}" \
-              -d parse_mode="HTML" \
-              -d text="$MESSAGE" || true
+            python3 -c "
+import os, json, urllib.request
+
+token = os.environ.get('TELEGRAM_BOT_TOKEN')
+chat_id = os.environ.get('TELEGRAM_CHAT_ID')
+text = '''$TEXT'''
+
+payload = json.dumps({
+    'chat_id': chat_id,
+    'text': text,
+    'parse_mode': 'Markdown'
+}).encode('utf-8')
+
+req = urllib.request.Request(
+    f'https://api.telegram.org/bot{token}/sendMessage',
+    data=payload,
+    headers={'Content-Type': 'application/json'}
+)
+try:
+    with urllib.request.urlopen(req) as resp:
+        print('Telegram notification sent successfully.')
+except Exception as e:
+    print('Failed to send Telegram alert:', e)
+"
           fi
