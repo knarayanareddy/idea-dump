@@ -26,7 +26,7 @@ CREATE TABLE IF NOT EXISTS ideas (
     uuid UUID DEFAULT uuid_generate_v4() UNIQUE,
     created_at TIMESTAMPTZ DEFAULT NOW(),
     updated_at TIMESTAMPTZ DEFAULT NOW(),
-    day_of_week TEXT GENERATED ALWAYS AS (TO_CHAR(created_at, 'Day')) STORED,
+    day_of_week TEXT,
     
     title TEXT,
     raw_content TEXT NOT NULL,
@@ -46,20 +46,23 @@ CREATE TABLE IF NOT EXISTS ideas (
     feasibility_score NUMERIC(3, 2) CHECK (feasibility_score >= 0.0 AND feasibility_score <= 1.0)
 );
 
--- 4. Automatic updated_at Trigger
-CREATE OR REPLACE FUNCTION update_modified_column()
+-- 4. Automatic metadata & updated_at Trigger
+CREATE OR REPLACE FUNCTION handle_idea_before_save()
 RETURNS TRIGGER AS $$
 BEGIN
     NEW.updated_at = NOW();
+    IF NEW.day_of_week IS NULL THEN
+        NEW.day_of_week = TO_CHAR(COALESCE(NEW.created_at, NOW()) AT TIME ZONE 'UTC', 'FMDay');
+    END IF;
     RETURN NEW;
 END;
 $$ LANGUAGE plpgsql;
 
-DROP TRIGGER IF EXISTS set_ideas_updated_at ON ideas;
-CREATE TRIGGER set_ideas_updated_at
-    BEFORE UPDATE ON ideas
+DROP TRIGGER IF EXISTS trg_ideas_before_save ON ideas;
+CREATE TRIGGER trg_ideas_before_save
+    BEFORE INSERT OR UPDATE ON ideas
     FOR EACH ROW
-    EXECUTE FUNCTION update_modified_column();
+    EXECUTE FUNCTION handle_idea_before_save();
 
 -- 5. Performance Indexes for High-Volume Querying
 CREATE INDEX IF NOT EXISTS idx_ideas_status ON ideas(status);

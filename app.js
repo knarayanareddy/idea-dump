@@ -106,24 +106,43 @@ async function initApp() {
   renderApp();
 }
 
+// Default Supabase project credentials for idea-dump
+const SUPABASE_DEFAULT_URL = 'https://akvklicuxnpgunivmrvo.supabase.co';
+const SUPABASE_DEFAULT_ANON_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImFrdmtsaWN1eG5wZ3VuaXZtcnZvIiwicm9sZSI6ImFub24iLCJpYXQiOjE3OTA1MzMzNDQsImV4cCI6MjEwNjEwOTM0NH0.tNq04eaZjzkFUmiABQhZ9Rwpcky1vgUdukRjvV6DZvo';
+
 function loadSavedConfig() {
   try {
+    let url = SUPABASE_DEFAULT_URL;
+    let key = SUPABASE_DEFAULT_ANON_KEY;
+
     const raw = localStorage.getItem(STATE.configKey);
     if (raw) {
       const config = JSON.parse(raw);
-      if (config.url && config.key && window.supabase) {
-        STATE.supabase = window.supabase.createClient(config.url, config.key);
-        STATE.isDemoMode = false;
-        updateConnectionBadge(true);
-        DOM.supabaseUrlInput.value = config.url;
-        DOM.supabaseKeyInput.value = config.key;
+      if (config.mode === 'demo') {
+        // Explicitly requested demo mode
+        STATE.isDemoMode = true;
+        updateConnectionBadge(false);
         return;
       }
+      if (config.url && config.key) {
+        url = config.url;
+        key = config.key;
+      }
+    }
+
+    if (url && key && window.supabase) {
+      STATE.supabase = window.supabase.createClient(url, key);
+      STATE.isDemoMode = false;
+      updateConnectionBadge(true);
+      DOM.supabaseUrlInput.value = url;
+      DOM.supabaseKeyInput.value = key;
+      return;
     }
   } catch (err) {
     console.error('Config load error:', err);
   }
-  // Default to Demo Mode
+
+  // Fallback to Demo Mode if client cannot be created
   STATE.isDemoMode = true;
   updateConnectionBadge(false);
 }
@@ -532,7 +551,7 @@ function setupEventListeners() {
 
   // Clear config / Switch to Demo
   DOM.clearConfigBtn.addEventListener('click', () => {
-    localStorage.removeItem(STATE.configKey);
+    localStorage.setItem(STATE.configKey, JSON.stringify({ mode: 'demo' }));
     STATE.supabase = null;
     STATE.isDemoMode = true;
     updateConnectionBadge(false);
