@@ -6,7 +6,7 @@ on:
       repos:
         description: "Target GitHub repositories to build (comma-separated, e.g. knarayanareddy/project-one,knarayanareddy/project-two)"
         type: string
-        required: true
+        required: false
         default: ""
       dry_run:
         description: "Dry run (generate code locally, do not push to target repos)"
