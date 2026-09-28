@@ -3,6 +3,7 @@
   "description": "Target repositories for the autonomous overnight spec-driven builder",
   "repositories": [
     "knarayanareddy/clausewindow",
-    "knarayanareddy/listguard"
+    "knarayanareddy/listguard",
+    "knarayanareddy/exhibit"
   ]
 }

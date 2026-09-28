@@ -53,7 +53,7 @@ jobs:
 
       - name: Install Builder Dependencies
         run: |
-          pip install --upgrade pip pytest requests fastapi uvicorn httpx pydantic rich pypdf jinja2 python-multipart pyyaml
+          pip install --upgrade pip pytest pytest-asyncio requests fastapi uvicorn httpx pydantic rich pypdf jinja2 python-multipart pyyaml
 
       - name: Run Spec-Driven Builder
         id: run_builder
@@ -81,8 +81,12 @@ jobs:
             TARGET_LIST="$TARGET_REPOS"
           fi
 
+          if [ -z "$TARGET_LIST" ] && [ -f config/overnight_targets.json ]; then
+            TARGET_LIST=$(python3 -c "import json; print(','.join(json.load(open('config/overnight_targets.json')).get('repositories', [])))")
+          fi
+
           if [ -z "$TARGET_LIST" ]; then
-            echo "::error ::No target repositories specified! Set --repos in workflow_dispatch or configure OVERNIGHT_TARGET_REPOS repository variable."
+            echo "::error ::No target repositories specified! Set --repos in workflow_dispatch, configure OVERNIGHT_TARGET_REPOS repository variable, or set config/overnight_targets.json."
             exit 1
           fi
 

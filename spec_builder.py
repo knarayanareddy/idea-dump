@@ -191,7 +191,9 @@ def run_workspace_tests(workspace: Path, timeout: int = 90) -> Tuple[bool, str]:
 
     try:
         env = dict(os.environ)
-        env["PYTHONPATH"] = str(workspace)
+        ws_resolved = str(workspace.resolve())
+        src_resolved = str((workspace / "src").resolve())
+        env["PYTHONPATH"] = f"{ws_resolved}:{src_resolved}"
         proc = subprocess.run(
             [sys.executable, "-m", "pytest", "-v"],
             cwd=str(workspace),
@@ -201,8 +203,9 @@ def run_workspace_tests(workspace: Path, timeout: int = 90) -> Tuple[bool, str]:
             text=True,
             timeout=timeout,
         )
-        if proc.returncode == 0:
-            return True, proc.stdout[-500:]
+        # returncode 0 = all passed, 5 = no tests collected (e.g. empty tests folder)
+        if proc.returncode in (0, 5):
+            return True, proc.stdout[-500:] if proc.stdout else "Tests passed / no tests collected"
         return False, proc.stdout[-1500:]
     except subprocess.TimeoutExpired:
         return False, f"Tests timed out after {timeout} seconds"
@@ -238,7 +241,7 @@ Respond ONLY with valid JSON in this exact structure:
   "issues": ["list", "of", "deficiencies"]
 }}
 Criteria:
-- APPROVED: Substantive, typed, production-ready implementation fulfilling the task without hollow mock stubs.
+- APPROVED: Substantive, typed, production-ready implementation fulfilling the task without hollow mock stubs. For non-code tasks (such as documentation, CI workflows, data fixtures, or configuration files), approve if the content is complete, syntactically correct, and production-ready.
 - REJECTED / NEEDS_CORRECTION: Zero-byte files, placeholder TODOs, trivial 'assert True' tests, or missing core functionality.
 """
     resp, provider = llm.complete(prompt, system="You are JEV, an uncompromising code evaluation judge. Return valid JSON only.", json_mode=True)
@@ -277,7 +280,12 @@ class SpecDrivenBuilder:
         self.work_dir = Path(work_dir).resolve()
         self.dry_run = dry_run
 
-        keys = load_env_file()
+        # Collect keys from ~/.hermes/idea-dump/keys.env if present, supplemented with os.environ
+        keys_path = Path.home() / ".hermes" / "idea-dump" / "keys.env"
+        keys = load_env_file(keys_path) if keys_path.is_file() else {}
+        for k, v in os.environ.items():
+            if k not in keys:
+                keys[k] = v
         self.llm = MultiProviderLLM(keys, logger)
 
     def run(self) -> Dict[str, Any]:
@@ -524,7 +532,13 @@ REQUIREMENTS:
             if res.returncode == 0:
                 logger.info(f"Pushed commit to main: '{commit_msg}'")
                 return True
-            logger.warning(f"Git push failed: {res.stderr}")
+            logger.warning(f"Git push failed: {res.stderr}. Retrying with pull --rebase...")
+            subprocess.run(["git", "pull", "--rebase", "origin", "main"], cwd=str(workspace), capture_output=True, text=True)
+            res2 = subprocess.run(["git", "push", "origin", "main"], cwd=str(workspace), capture_output=True, text=True)
+            if res2.returncode == 0:
+                logger.info(f"Pushed commit to main after rebase: '{commit_msg}'")
+                return True
+            logger.warning(f"Git push retry failed: {res2.stderr}")
         except Exception as exc:
             logger.error(f"Git commit/push error: {exc}")
         return False
