@@ -243,6 +243,7 @@ class MultiProviderLLM:
         self.gemini_key = keys.get("GEMINI_API_KEY") or keys.get("GOOGLE_API_KEY")
         self.openrouter_key = keys.get("OPENROUTER_API_KEY")
         self.openrouter_models = [
+            "stealth/space-bunny-alpha",
             "cohere/north-mini-code:free",
             "google/gemma-4-26b-a4b-it:free",
         ]
