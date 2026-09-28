@@ -615,6 +615,7 @@ def synthesize_prototype(
     specs: Dict[str, str],
     llm: MultiProviderLLM,
     logger: logging.Logger,
+    feedback_issues: Optional[List[str]] = None,
 ) -> Dict[str, str]:
     """
     Synthesize complete, real, functional prototype code files:
@@ -634,9 +635,68 @@ def synthesize_prototype(
     tags = idea.get("tags") or []
     tags_str = ", ".join(tags) if isinstance(tags, list) else str(tags)
 
-    logger.info(f"Synthesizing substantive prototype implementation for '{title}' (pkg: {pkg_name})...")
-    files = generate_deterministic_prototype(title, pkg_name, raw_content, tags)
-    logger.info(f"Synthesized {len(files)} prototype files across package modules, CLI, and test suite.")
+    logger.info(f"Synthesizing substantive bespoke prototype implementation for '{title}' (pkg: {pkg_name}) via Space Bunny Alpha...")
+
+    feedback_prompt = ""
+    if feedback_issues:
+        feedback_prompt = f"""
+CRITICAL FIX REQUIRED: A previous attempt was REJECTED by Jev Quality Gate with the following issues:
+{chr(10).join(f"- {issue}" for issue in feedback_issues)}
+You MUST completely fix these issues. DO NOT output generic ItemModel or mock registries.
+Build genuine domain-specific models, business logic, CLI, and integration tests matching '{title}'.
+"""
+
+    prompt = f"""
+You are an expert autonomous software engineer.
+Generate a complete, fully functional, production-ready Python package prototype for:
+Title: {title}
+Tags: {tags_str}
+Description: {raw_content}
+
+{feedback_prompt}
+
+REQUIREMENTS:
+1. No toy mocks, no placeholder stubs (NO TODO, NO FIXME, NO 'ItemModel' or generic placeholders).
+2. Write real algorithms and substantive domain-specific business logic for '{title}'.
+3. Package structure must include:
+   - requirements.txt (all real required pip packages)
+   - {pkg_name}/__init__.py
+   - {pkg_name}/models.py (rich domain data models with validation)
+   - {pkg_name}/engine.py (real business logic executing actual tasks)
+   - {pkg_name}/cli.py (argparse CLI with substantive commands)
+   - main.py (entrypoint dispatching CLI)
+   - tests/test_core.py (at least 6-8 real pytest unit tests that test actual execution, edge cases, and outputs)
+4. All code must be valid, executable Python 3.12 without syntax errors.
+
+OUTPUT FORMAT:
+Output each file in standard markdown code blocks preceded by FILE: <rel_path>, e.g.:
+
+FILE: requirements.txt
+```
+...
+```
+
+FILE: {pkg_name}/models.py
+```python
+...
+```
+"""
+    system = "You are a Principal Software Architect. Synthesize production-grade, fully working, bespoke software with comprehensive unit tests."
+    resp, provider = llm.complete(prompt, system=system, timeout=180)
+    files = {}
+    if resp:
+        pattern = re.compile(r"FILE:\s*([^\n\r]+)\s*```[a-zA-Z0-9_\-\.]*\n(.*?)```", re.DOTALL)
+        for match in pattern.finditer(resp):
+            fpath = match.group(1).strip()
+            fcode = match.group(2)
+            if fpath and fcode:
+                files[fpath] = fcode
+        if files:
+            logger.info(f"Successfully extracted {len(files)} bespoke files from {provider}")
+
+    if not files:
+        logger.warning("LLM bespoke synthesis returned no files; falling back to deterministic baseline...")
+        files = generate_deterministic_prototype(title, pkg_name, raw_content, tags)
 
     # Always ensure .gitignore and requirements.txt exist
     if ".gitignore" not in files:
@@ -1521,35 +1581,61 @@ def process_selected_idea(
         logger.error(f"Failed to update Idea #{idea_id} to spec_ready: {e}")
         return False
 
-    # 3. Prototype Code Synthesis in isolated temporary sandbox
+    # 3. Prototype Code Synthesis with Multi-Attempt Adversarial Refinement Loop
+    max_attempts = 3
+    approved = False
+    quality_score = 0
+    quality_reason = ""
+    issues = []
+
     with tempfile.TemporaryDirectory() as sandbox_str:
         sandbox_path = Path(sandbox_str)
-        synthesized_files = synthesize_prototype(idea, specs, llm, logger)
 
-        for rel_path, content in synthesized_files.items():
-            out_file = sandbox_path / rel_path
-            out_file.parent.mkdir(parents=True, exist_ok=True)
-            out_file.write_text(content, encoding="utf-8")
+        for attempt in range(1, max_attempts + 1):
+            logger.info(f"--- Prototype Build Attempt {attempt}/{max_attempts} for Idea #{idea_id} ---")
+            synthesized_files = synthesize_prototype(
+                idea, specs, llm, logger, feedback_issues=issues if attempt > 1 else None
+            )
 
-        # 4. Auto-install any dependencies the prototype declared
-        _auto_install_deps(sandbox_path, logger)
+            # Clear sandbox for fresh attempt
+            for item in sandbox_path.iterdir():
+                if item.is_dir():
+                    shutil.rmtree(item)
+                else:
+                    item.unlink()
 
-        # 5. Automated Sandbox Verification
-        logger.info(f"Executing automated sandbox test suite for Idea #{idea_id}...")
-        verif = execute_sandbox_verification(sandbox_path, logger)
+            for rel_path, content in synthesized_files.items():
+                out_file = sandbox_path / rel_path
+                out_file.parent.mkdir(parents=True, exist_ok=True)
+                out_file.write_text(content, encoding="utf-8")
 
-        # 6. Self-Correction Loop if tests failed
-        if not verif.passed:
-            verif = run_self_correction_loop(sandbox_path, verif, llm, logger)
+            # 4. Auto-install any dependencies the prototype declared
+            _auto_install_deps(sandbox_path, logger)
 
-        # 7. JEV Quality Gate Evaluation (heuristic + LLM review)
-        approved, quality_score, quality_reason, issues = jev_quality_evaluator(sandbox_path, verif, llm, logger)
+            # 5. Automated Sandbox Verification
+            logger.info(f"Executing automated sandbox test suite for Idea #{idea_id} (Attempt {attempt})...")
+            verif = execute_sandbox_verification(sandbox_path, logger)
+
+            # 6. Self-Correction Loop if tests failed
+            if not verif.passed:
+                verif = run_self_correction_loop(sandbox_path, verif, llm, logger)
+
+            # 7. JEV Quality Gate Evaluation (heuristic + LLM review)
+            approved, quality_score, quality_reason, issues = jev_quality_evaluator(sandbox_path, verif, llm, logger)
+
+            if approved:
+                logger.info(f"JEV Approved Idea #{idea_id} on Attempt {attempt}! Score: {quality_score}/10")
+                break
+            else:
+                logger.warning(
+                    f"JEV Quality Gate rejected Attempt {attempt}/{max_attempts} (Score: {quality_score}/10). Flaws: {issues}"
+                )
 
         if not approved:
-            logger.error(f"Quality gate rejected prototype for Idea #{idea_id}: {quality_reason}")
+            logger.error(f"Quality gate rejected prototype for Idea #{idea_id} after {max_attempts} attempts: {quality_reason}")
             client.patch("ideas", {"id": f"eq.{idea_id}"}, {
                 "status": "spec_ready",
-                "agent_notes": f"Specifications complete, but prototype code verification did not pass JEV quality gate: {quality_reason}",
+                "agent_notes": f"Specifications complete, but prototype code verification did not pass JEV quality gate after {max_attempts} attempts: {quality_reason}",
             })
             logger.warning(f"Idea #{idea_id} remains 'spec_ready' (NOT marked as built).")
 
