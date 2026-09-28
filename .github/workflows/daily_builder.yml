@@ -57,7 +57,7 @@ jobs:
 
       - name: Install Runner Dependencies
         run: |
-          pip install --upgrade pip pytest requests supabase
+          pip install --upgrade pip pytest requests supabase fastapi uvicorn httpx pydantic
 
       - name: Run Daily Builder Pipeline
         id: run_builder
