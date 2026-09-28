@@ -241,11 +241,18 @@ class MultiProviderLLM:
         self.keys = keys
         self.logger = logger
         self.gemini_key = keys.get("GEMINI_API_KEY") or keys.get("GOOGLE_API_KEY")
-        self.openrouter_key = keys.get("OPENROUTER_API_KEY")
+        # Collect all pooled OpenRouter keys
+        self.openrouter_keys: List[str] = []
+        for k, v in keys.items():
+            if k.startswith("OPENROUTER_API_KEY") and v.strip():
+                clean_v = v.strip().strip('"').strip("'")
+                if clean_v not in self.openrouter_keys:
+                    self.openrouter_keys.append(clean_v)
+        self.current_key_idx = 0
+        if self.openrouter_keys:
+            self.logger.info(f"MultiProviderLLM initialized with {len(self.openrouter_keys)} OpenRouter account keys for stealth/space-bunny-alpha.")
         self.openrouter_models = [
             "stealth/space-bunny-alpha",
-            "cohere/north-mini-code:free",
-            "google/gemma-4-26b-a4b-it:free",
         ]
 
     def complete(
@@ -253,12 +260,15 @@ class MultiProviderLLM:
         prompt: str,
         system: str = "",
         json_mode: bool = False,
-        timeout: int = 12,
+        timeout: int = 180,
     ) -> Tuple[Optional[str], str]:
-        """Request completion from Gemini or OpenRouter free models with fallback."""
-        # 1. Try OpenRouter cascade
-        if self.openrouter_key:
-            for model_name in self.openrouter_models:
+        """Request completion from OpenRouter stealth/space-bunny-alpha with key rotation and Gemini fallback."""
+        # 1. Try OpenRouter keys pool on space-bunny-alpha
+        if self.openrouter_keys:
+            model_name = "stealth/space-bunny-alpha"
+            for attempt in range(len(self.openrouter_keys)):
+                key = self.openrouter_keys[self.current_key_idx % len(self.openrouter_keys)]
+                key_tag = f"key-{self.current_key_idx + 1}/{len(self.openrouter_keys)}"
                 try:
                     payload = {
                         "model": model_name,
@@ -272,7 +282,7 @@ class MultiProviderLLM:
                         "https://openrouter.ai/api/v1/chat/completions",
                         data=json.dumps(payload).encode("utf-8"),
                         headers={
-                            "Authorization": f"Bearer {self.openrouter_key}",
+                            "Authorization": f"Bearer {key}",
                             "Content-Type": "application/json",
                             "HTTP-Referer": "https://github.com/knarayanareddy/idea-dump",
                             "X-Title": "IdeaDump Autonomous Builder",
@@ -283,13 +293,15 @@ class MultiProviderLLM:
                         data = json.loads(resp.read().decode("utf-8"))
                         content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
                         if content and content.strip():
-                            return content.strip(), f"openrouter/{model_name}"
+                            return content.strip(), f"openrouter/{model_name} [{key_tag}]"
                 except urllib.error.HTTPError as exc:
-                    self.logger.debug(f"OpenRouter {model_name} HTTP {exc.code}; trying next model")
+                    self.logger.warning(f"OpenRouter space-bunny-alpha HTTP {exc.code} on {key_tag}; rotating to next account key")
+                    self.current_key_idx = (self.current_key_idx + 1) % len(self.openrouter_keys)
                     time.sleep(1)
                     continue
                 except Exception as exc:
-                    self.logger.debug(f"OpenRouter {model_name} error: {exc}; trying next model")
+                    self.logger.warning(f"OpenRouter space-bunny-alpha error on {key_tag}: {exc}; rotating to next key")
+                    self.current_key_idx = (self.current_key_idx + 1) % len(self.openrouter_keys)
                     time.sleep(1)
                     continue
 
