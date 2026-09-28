@@ -51,7 +51,11 @@ PAUSE_FILE = HERMES_DIR / "PAUSED"
 LOCK_FILE = HERMES_DIR / "run.lock"
 LOG_DIR = HERMES_DIR / "log"
 LOG_FILE = LOG_DIR / "builder.log"
+LESSONS_FILE = HERMES_DIR / "lessons_learned.jsonl"
 SCRATCH_OUTPUT_DIR = BASE_DIR / "scratch" / "output"
+
+# Maximum number of recent lessons to inject as pre-build constraints
+MAX_LESSONS_CONTEXT = 15
 
 
 def setup_logging(verbose: bool = False) -> logging.Logger:
@@ -1048,50 +1052,306 @@ Respond in JSON with a 'files' map containing only the file(s) that need fixes:
 def jev_quality_evaluator(
     sandbox_dir: Path,
     verification: VerificationResult,
+    llm: MultiProviderLLM,
     logger: logging.Logger,
-) -> Tuple[bool, int, str]:
+) -> Tuple[bool, int, str, List[str]]:
     """
-    Rigorous quality gate to prevent false-positives and superficial stubs:
-    - Verifies test passage.
-    - Inspects for empty `pass`, `# TODO`, or hollow methods.
-    - Evaluates substantive line count and functional breadth.
-    Returns (approved, quality_score_1_to_10, reason).
-    """
-    if not verification.passed:
-        return False, 2, f"Failed sandbox execution: {verification.error_log[:150]}"
+    Multi-tier quality gate combining local heuristics with JEV LLM review.
+    Returns (approved, quality_score_1_to_10, reason, issues_list).
 
+    Tier 1: Sandbox test verification (must pass).
+    Tier 2: Local heuristic inspection (hollow stubs, LOC thresholds).
+    Tier 3: JEV LLM self-review — the model reviews its own output
+            and flags weaknesses, even on apparent success.
+    """
+    issues: List[str] = []
+
+    # Tier 1: Sandbox verification must have passed
+    if not verification.passed:
+        issues.append(f"Sandbox failed: {verification.error_log[:150]}")
+        return False, 2, f"Failed sandbox execution: {verification.error_log[:150]}", issues
+
+    # Tier 2: Local heuristic inspection
     py_files = list(sandbox_dir.rglob("*.py"))
     total_loc = 0
     hollow_patterns = [
         re.compile(r"^\s*pass\s*$", re.MULTILINE),
         re.compile(r"raise NotImplementedError", re.IGNORECASE),
         re.compile(r"#\s*TODO\b", re.IGNORECASE),
+        re.compile(r"\bplaceholder\b", re.IGNORECASE),
+        re.compile(r"\bfixme\b", re.IGNORECASE),
     ]
 
     hollow_hits = 0
+    source_summary_lines: List[str] = []
     for pf in py_files:
         if "tests" in pf.parts:
             continue
         try:
             content = pf.read_text(encoding="utf-8")
-            total_loc += len([line for line in content.splitlines() if line.strip() and not line.strip().startswith("#")])
+            code_lines = [line for line in content.splitlines() if line.strip() and not line.strip().startswith("#")]
+            total_loc += len(code_lines)
             for pat in hollow_patterns:
-                if pat.search(content):
-                    hollow_hits += 1
+                hits = pat.findall(content)
+                hollow_hits += len(hits)
+            # Collect first 30 lines of each source file for LLM review
+            rel = pf.relative_to(sandbox_dir)
+            source_summary_lines.append(f"--- {rel} ({len(code_lines)} LOC) ---")
+            source_summary_lines.extend(content.splitlines()[:30])
         except Exception:
             pass
 
     if total_loc < 50:
-        return False, 4, f"Prototype code too thin ({total_loc} LOC). Does not meet substantive threshold."
+        issues.append(f"Code too thin: only {total_loc} LOC (minimum 50).")
+        return False, 4, f"Prototype code too thin ({total_loc} LOC).", issues
 
     if hollow_hits > 2:
-        return False, 3, f"Detected {hollow_hits} hollow placeholder patterns in production modules."
+        issues.append(f"{hollow_hits} hollow placeholder patterns detected.")
+        return False, 3, f"Detected {hollow_hits} hollow placeholder patterns.", issues
 
-    # Passed all criteria with flying colors
-    score = 9 if verification.test_count >= 5 else 8
-    reason = f"Verified: {verification.test_count} unit tests passed, {total_loc} substantive LOC, 0 syntax/runtime errors."
-    logger.info(f"JEV Quality Gate: APPROVED (Score: {score}/10) - {reason}")
-    return True, score, reason
+    # Tier 3: JEV LLM Self-Review
+    # The model critically reviews its own generated code and flags issues,
+    # even if tests passed. This catches false-positive successes.
+    base_score = 9 if verification.test_count >= 5 else 8
+    base_reason = f"Verified: {verification.test_count} unit tests passed, {total_loc} substantive LOC, 0 syntax/runtime errors."
+
+    source_preview = "\n".join(source_summary_lines[:200])
+    jev_prompt = f"""You are JEV, an autonomous code quality evaluator (System One decision model).
+Review this auto-generated prototype that passed {verification.test_count} unit tests with {total_loc} LOC.
+
+Source Preview:
+{source_preview}
+
+Evaluate critically:
+1. Is this GENUINE working code or superficial stubs disguised as passing tests?
+2. Are the tests actually testing real behaviour or trivially asserting True?
+3. Does the architecture have real domain logic or is it generic boilerplate?
+4. Any security concerns (hardcoded secrets, unsafe eval, etc.)?
+
+Respond in JSON:
+{{
+  "quality_score": <int 1-10>,
+  "is_false_positive": <bool>,
+  "issues": ["list of specific concerns"],
+  "verdict": "APPROVED" | "NEEDS_IMPROVEMENT" | "REJECTED"
+}}"""
+
+    jev_resp, jev_provider = llm.complete(jev_prompt, system="You are JEV. Respond in valid JSON only.", json_mode=True)
+    if jev_resp:
+        try:
+            clean = re.sub(r"^```(?:json)?\s*", "", jev_resp.strip())
+            clean = re.sub(r"\s*```$", "", clean)
+            jev_data = json.loads(clean)
+            jev_score = int(jev_data.get("quality_score", base_score))
+            jev_false_pos = bool(jev_data.get("is_false_positive", False))
+            jev_issues = list(jev_data.get("issues", []))
+            jev_verdict = str(jev_data.get("verdict", "APPROVED")).upper()
+
+            issues.extend(jev_issues)
+            logger.info(f"JEV Review ({jev_provider}): Score={jev_score}/10, Verdict={jev_verdict}, Issues={len(jev_issues)}")
+
+            if jev_false_pos or jev_verdict == "REJECTED":
+                reason = f"JEV flagged as false positive or rejected: {', '.join(jev_issues[:3])}"
+                return False, min(jev_score, 4), reason, issues
+
+            # Blend scores: weight heuristic 40%, JEV 60%
+            final_score = round(0.4 * base_score + 0.6 * jev_score)
+            final_score = max(1, min(10, final_score))
+
+            if final_score < 6:
+                return False, final_score, f"Blended score {final_score}/10 below threshold.", issues
+
+            reason = f"{base_reason} JEV review: {jev_score}/10 ({jev_provider})."
+            logger.info(f"JEV Quality Gate: APPROVED (Score: {final_score}/10) - {reason}")
+            return True, final_score, reason, issues
+
+        except Exception as e:
+            logger.debug(f"JEV response parsing failed: {e}; using heuristic score.")
+
+    # Fallback: heuristic-only approval
+    logger.info(f"JEV Quality Gate: APPROVED (Score: {base_score}/10, heuristic-only) - {base_reason}")
+    return True, base_score, base_reason, issues
+
+
+# ==============================================================================
+# Persistent Learning Loop — Lessons Ledger
+# ==============================================================================
+
+class LessonsLedger:
+    """
+    Persistent self-improving learning loop.
+
+    After every build (success or failure), the builder records a structured
+    lesson to ~/.hermes/idea-dump/lessons_learned.jsonl. Before each new build,
+    recent lessons are loaded and injected as constraints so the builder never
+    repeats the same mistake twice.
+
+    Each lesson entry contains:
+    - timestamp: ISO-8601 timestamp of the build
+    - idea_id: the Supabase idea ID
+    - idea_title: human-readable title
+    - outcome: "success" | "failure"
+    - quality_score: JEV quality score (1-10)
+    - phase_failed: which phase failed (if any): "synthesis" | "sandbox" | "jev" | "deploy" | null
+    - issues: list of specific problems identified
+    - root_cause: brief diagnosis of the root cause
+    - lesson: actionable constraint for future builds (the learning)
+    - corrective_action: what the builder should do differently next time
+    """
+
+    def __init__(self, filepath: Path, logger: logging.Logger):
+        self.filepath = filepath
+        self.logger = logger
+        self.filepath.parent.mkdir(parents=True, exist_ok=True)
+
+    def record(
+        self,
+        idea_id: int,
+        idea_title: str,
+        outcome: str,
+        quality_score: int,
+        phase_failed: Optional[str],
+        issues: List[str],
+        root_cause: str,
+        lesson: str,
+        corrective_action: str,
+    ) -> None:
+        """Append a structured lesson entry to the JSONL ledger."""
+        entry = {
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "idea_id": idea_id,
+            "idea_title": idea_title,
+            "outcome": outcome,
+            "quality_score": quality_score,
+            "phase_failed": phase_failed,
+            "issues": issues[:10],
+            "root_cause": root_cause[:300],
+            "lesson": lesson[:300],
+            "corrective_action": corrective_action[:300],
+        }
+        try:
+            with open(self.filepath, "a", encoding="utf-8") as f:
+                f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+            self.logger.info(f"Recorded lesson for Idea #{idea_id} ({outcome}): {lesson[:80]}")
+        except Exception as e:
+            self.logger.warning(f"Failed to write lesson to ledger: {e}")
+
+    def load_recent(self, max_entries: int = MAX_LESSONS_CONTEXT) -> List[Dict[str, Any]]:
+        """Load the most recent lesson entries from the JSONL ledger."""
+        if not self.filepath.exists():
+            return []
+        entries: List[Dict[str, Any]] = []
+        try:
+            with open(self.filepath, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if line:
+                        try:
+                            entries.append(json.loads(line))
+                        except json.JSONDecodeError:
+                            pass
+        except Exception as e:
+            self.logger.debug(f"Could not read lessons ledger: {e}")
+        return entries[-max_entries:]
+
+    def format_constraints_for_synthesis(self) -> str:
+        """
+        Format recent lessons into a human-readable constraint block
+        that can be injected into the synthesis prompt.
+        """
+        recent = self.load_recent()
+        if not recent:
+            return ""
+
+        failures = [e for e in recent if e.get("outcome") == "failure"]
+        successes = [e for e in recent if e.get("outcome") == "success"]
+
+        lines = ["### Lessons from Previous Builds (DO NOT repeat these mistakes):"]
+
+        if failures:
+            lines.append(f"\n**{len(failures)} past failure(s) to avoid:**")
+            for idx, f_entry in enumerate(failures[-5:], 1):
+                lesson = f_entry.get("lesson", "Unknown")
+                corrective = f_entry.get("corrective_action", "")
+                phase = f_entry.get("phase_failed", "unknown")
+                lines.append(f"  {idx}. [{phase}] {lesson}")
+                if corrective:
+                    lines.append(f"     → Fix: {corrective}")
+
+        if successes:
+            avg_score = sum(s.get("quality_score", 0) for s in successes) / len(successes)
+            lines.append(f"\n**{len(successes)} successful build(s)** (avg quality: {avg_score:.1f}/10)")
+
+        return "\n".join(lines)
+
+    def generate_post_build_lesson(
+        self,
+        idea_id: int,
+        idea_title: str,
+        outcome: str,
+        quality_score: int,
+        phase_failed: Optional[str],
+        issues: List[str],
+        llm: MultiProviderLLM,
+    ) -> None:
+        """
+        After a build, use the LLM to reflect on what happened
+        and extract a reusable lesson + corrective action.
+        """
+        issues_text = "\n".join(f"- {i}" for i in issues[:8]) if issues else "- None identified."
+
+        if outcome == "success":
+            reflect_prompt = f"""A prototype was autonomously built for "{idea_title}" and PASSED verification (score: {quality_score}/10).
+Issues noted during review:
+{issues_text}
+
+Even though it passed, reflect on what could be improved for future builds.
+Respond in JSON:
+{{
+  "root_cause": "brief analysis of any weaknesses",
+  "lesson": "actionable constraint for future builds",
+  "corrective_action": "specific change to make next time"
+}}"""
+        else:
+            reflect_prompt = f"""A prototype build for "{idea_title}" FAILED at the {phase_failed or 'unknown'} phase (score: {quality_score}/10).
+Issues:
+{issues_text}
+
+Diagnose the root cause and extract a lesson so this never happens again.
+Respond in JSON:
+{{
+  "root_cause": "what went wrong and why",
+  "lesson": "constraint to prevent this in future builds",
+  "corrective_action": "specific implementation change needed"
+}}"""
+
+        resp, _ = llm.complete(reflect_prompt, system="You are a build retrospective analyst. Respond in JSON only.", json_mode=True)
+        root_cause = "Automated analysis unavailable."
+        lesson = f"Build {'succeeded' if outcome == 'success' else 'failed'} for {idea_title}."
+        corrective = "Review and improve synthesis templates."
+
+        if resp:
+            try:
+                clean = re.sub(r"^```(?:json)?\s*", "", resp.strip())
+                clean = re.sub(r"\s*```$", "", clean)
+                parsed = json.loads(clean)
+                root_cause = str(parsed.get("root_cause", root_cause))
+                lesson = str(parsed.get("lesson", lesson))
+                corrective = str(parsed.get("corrective_action", corrective))
+            except Exception:
+                pass
+
+        self.record(
+            idea_id=idea_id,
+            idea_title=idea_title,
+            outcome=outcome,
+            quality_score=quality_score,
+            phase_failed=phase_failed,
+            issues=issues,
+            root_cause=root_cause,
+            lesson=lesson,
+            corrective_action=corrective,
+        )
 
 
 # ==============================================================================
@@ -1162,18 +1422,22 @@ def process_selected_idea(
     decision_memo: str,
     client: SupabaseClient,
     llm: MultiProviderLLM,
+    ledger: LessonsLedger,
     dry_run: bool,
     logger: logging.Logger,
 ) -> bool:
     """
     Full build pipeline for the selected winner idea:
-    1. Formulation of OpenSpec specifications & blueprints.
-    2. Strict database transition to 'spec_ready' (NEVER 'built').
-    3. Autonomous prototype code synthesis (models, core engine, CLI, tests).
-    4. Sandboxed test execution and verification.
-    5. Automated self-correction if tests fail.
-    6. JEV anti-false-positive quality gate evaluation.
-    7. IF and ONLY IF verified: GitHub repository push and update status to 'built'.
+    1. Load lessons from previous builds (avoid repeating mistakes).
+    2. Formulation of OpenSpec specifications & blueprints.
+    3. Strict database transition to 'spec_ready' (NEVER 'built').
+    4. Autonomous prototype code synthesis with lessons-aware constraints.
+    5. Auto-install missing dependencies in sandbox.
+    6. Sandboxed test execution and verification.
+    7. Automated self-correction if tests fail (up to 3 iterations).
+    8. JEV anti-false-positive quality gate evaluation (heuristic + LLM).
+    9. Post-build self-review: record lesson regardless of outcome.
+    10. IF and ONLY IF verified: GitHub repository push and update status to 'built'.
     """
     idea_id = idea["id"]
     title = idea.get("title") or f"Idea {idea_id}"
@@ -1182,9 +1446,20 @@ def process_selected_idea(
     logger.info(f"--- Processing Idea #{idea_id}: '{title}' (slug: {slug}) ---")
     logger.info(f"=======================================================")
 
+    # 0. Load lessons from previous builds as constraints
+    lessons_constraints = ledger.format_constraints_for_synthesis()
+    if lessons_constraints:
+        logger.info(f"Loaded {len(ledger.load_recent())} lesson(s) from previous builds.")
+    else:
+        logger.info("No previous lessons found (first run).")
+
     # 1. Blueprint Phase: Formulate specs
     specs = generate_specs(idea, decision_memo, logger)
     logger.info(f"Generated specifications: {list(specs.keys())}")
+
+    # Inject lessons constraints into the SPEC.md so the synthesizer sees them
+    if lessons_constraints and "SPEC.md" in specs:
+        specs["SPEC.md"] = specs["SPEC.md"] + f"\n\n{lessons_constraints}\n"
 
     # In dry-run mode, write specs and synthesized files to scratch/output/ and verify
     if dry_run:
@@ -1198,14 +1473,28 @@ def process_selected_idea(
             fpath.parent.mkdir(parents=True, exist_ok=True)
             fpath.write_text(content, encoding="utf-8")
 
+        # Auto-install requirements if present
+        _auto_install_deps(idea_dir, logger)
+
         logger.info(f"[DRY-RUN] Executing sandbox verification on {idea_dir}...")
         verif = execute_sandbox_verification(idea_dir, logger)
         if not verif.passed:
             verif = run_self_correction_loop(idea_dir, verif, llm, logger)
 
-        approved, quality_score, reason = jev_quality_evaluator(idea_dir, verif, logger)
+        approved, quality_score, reason, issues = jev_quality_evaluator(idea_dir, verif, llm, logger)
         logger.info(f"[DRY-RUN] Verification Result: {'PASSED' if approved else 'FAILED'} (Score: {quality_score}/10)")
         logger.info(f"[DRY-RUN] Prototype staged locally at: {idea_dir}")
+
+        # Record lesson even for dry runs
+        ledger.generate_post_build_lesson(
+            idea_id=idea_id,
+            idea_title=title,
+            outcome="success" if approved else "failure",
+            quality_score=quality_score,
+            phase_failed=None if approved else "jev",
+            issues=issues,
+            llm=llm,
+        )
         return approved
 
     # 2. Database Status: Update to 'spec_ready' (NEVER 'built' at this stage!)
@@ -1229,16 +1518,19 @@ def process_selected_idea(
             out_file.parent.mkdir(parents=True, exist_ok=True)
             out_file.write_text(content, encoding="utf-8")
 
-        # 4. Automated Sandbox Verification
+        # 4. Auto-install any dependencies the prototype declared
+        _auto_install_deps(sandbox_path, logger)
+
+        # 5. Automated Sandbox Verification
         logger.info(f"Executing automated sandbox test suite for Idea #{idea_id}...")
         verif = execute_sandbox_verification(sandbox_path, logger)
 
-        # 5. Self-Correction Loop if tests failed
+        # 6. Self-Correction Loop if tests failed
         if not verif.passed:
             verif = run_self_correction_loop(sandbox_path, verif, llm, logger)
 
-        # 6. JEV Quality Gate Evaluation
-        approved, quality_score, quality_reason = jev_quality_evaluator(sandbox_path, verif, logger)
+        # 7. JEV Quality Gate Evaluation (heuristic + LLM review)
+        approved, quality_score, quality_reason, issues = jev_quality_evaluator(sandbox_path, verif, llm, logger)
 
         if not approved:
             logger.error(f"Quality gate rejected prototype for Idea #{idea_id}: {quality_reason}")
@@ -1247,9 +1539,20 @@ def process_selected_idea(
                 "agent_notes": f"Specifications complete, but prototype code verification did not pass JEV quality gate: {quality_reason}",
             })
             logger.warning(f"Idea #{idea_id} remains 'spec_ready' (NOT marked as built).")
+
+            # Record failure lesson
+            ledger.generate_post_build_lesson(
+                idea_id=idea_id,
+                idea_title=title,
+                outcome="failure",
+                quality_score=quality_score,
+                phase_failed="jev",
+                issues=issues,
+                llm=llm,
+            )
             return False
 
-        # 7. Deployment: Create GitHub Repo & Push Verified Code
+        # 8. Deployment: Create GitHub Repo & Push Verified Code
         try:
             repo_url, commit_hash = git_and_gh_create_repo(
                 slug=slug,
@@ -1264,9 +1567,19 @@ def process_selected_idea(
                 "status": "spec_ready",
                 "agent_notes": f"Verified in sandbox, but GitHub deployment failed: {e}",
             })
+            # Record deployment failure lesson
+            ledger.generate_post_build_lesson(
+                idea_id=idea_id,
+                idea_title=title,
+                outcome="failure",
+                quality_score=quality_score,
+                phase_failed="deploy",
+                issues=[str(e)],
+                llm=llm,
+            )
             return False
 
-        # 8. Register Project in Supabase projects table
+        # 9. Register Project in Supabase projects table
         project_id = None
         try:
             project_payload = {
@@ -1285,7 +1598,7 @@ def process_selected_idea(
         except Exception as e:
             logger.warning(f"Could not insert project row in projects table: {e}")
 
-        # 9. Final Promotion: Strictly grant 'built' status now that verified code is live
+        # 10. Final Promotion: Strictly grant 'built' status now that verified code is live
         try:
             update_payload = {
                 "status": "built",
@@ -1307,7 +1620,62 @@ def process_selected_idea(
             logger.error(f"Failed to update Idea #{idea_id} to built in Supabase: {e}")
             return False
 
+        # 11. Post-build self-review: Record success lesson
+        ledger.generate_post_build_lesson(
+            idea_id=idea_id,
+            idea_title=title,
+            outcome="success",
+            quality_score=quality_score,
+            phase_failed=None,
+            issues=issues,
+            llm=llm,
+        )
+
     return True
+
+
+def _auto_install_deps(sandbox_dir: Path, logger: logging.Logger) -> None:
+    """
+    Automatically install any missing Python or Node dependencies
+    declared in requirements.txt or package.json within the sandbox.
+    """
+    req_txt = sandbox_dir / "requirements.txt"
+    if req_txt.exists():
+        logger.info(f"Installing Python dependencies from {req_txt}...")
+        try:
+            result = subprocess.run(
+                [sys.executable, "-m", "pip", "install", "-r", str(req_txt), "--quiet"],
+                capture_output=True,
+                text=True,
+                timeout=120,
+                cwd=str(sandbox_dir),
+            )
+            if result.returncode != 0:
+                logger.warning(f"pip install returned {result.returncode}: {result.stderr[:200]}")
+            else:
+                logger.info("Python dependencies installed successfully.")
+        except Exception as e:
+            logger.warning(f"Failed to install Python dependencies: {e}")
+
+    pkg_json = sandbox_dir / "package.json"
+    if pkg_json.exists():
+        npm_cmd = shutil.which("npm")
+        if npm_cmd:
+            logger.info(f"Installing Node.js dependencies from {pkg_json}...")
+            try:
+                result = subprocess.run(
+                    [npm_cmd, "install", "--silent"],
+                    capture_output=True,
+                    text=True,
+                    timeout=120,
+                    cwd=str(sandbox_dir),
+                )
+                if result.returncode != 0:
+                    logger.warning(f"npm install returned {result.returncode}: {result.stderr[:200]}")
+                else:
+                    logger.info("Node.js dependencies installed successfully.")
+            except Exception as e:
+                logger.warning(f"Failed to install Node.js dependencies: {e}")
 
 
 # ==============================================================================
@@ -1354,10 +1722,36 @@ def main():
     parser.add_argument("--check-only", action="store_true", help="Test database connection, pause state, and GitHub auth, then exit.")
     parser.add_argument("--count-pending", action="store_true", help="Count remaining pending ideas in Supabase and exit.")
     parser.add_argument("--max-stale-minutes", type=int, default=None, help="Skip ideas queued longer than max minutes (useful after Mac wake).")
+    parser.add_argument("--show-lessons", action="store_true", help="Display the accumulated learning ledger and exit.")
     parser.add_argument("-v", "--verbose", action="store_true", help="Enable verbose debug logging.")
 
     args = parser.parse_args()
     logger = setup_logging(verbose=args.verbose)
+
+    # Handle --show-lessons before anything else (no lock needed)
+    if args.show_lessons:
+        ledger = LessonsLedger(LESSONS_FILE, logger)
+        entries = ledger.load_recent(max_entries=50)
+        if not entries:
+            print("No lessons recorded yet. The learning loop will begin after the first build.")
+            return 0
+        print(f"\n{'='*70}")
+        print(f"  LESSONS LEARNED LEDGER ({len(entries)} entries)")
+        print(f"{'='*70}\n")
+        for i, e in enumerate(entries, 1):
+            status = "✅" if e.get("outcome") == "success" else "❌"
+            print(f"  {status} [{e.get('timestamp', '?')[:19]}] Idea #{e.get('idea_id', '?')}: {e.get('idea_title', '?')}")
+            print(f"     Score: {e.get('quality_score', '?')}/10 | Phase: {e.get('phase_failed') or 'N/A'}")
+            print(f"     Lesson: {e.get('lesson', 'N/A')}")
+            print(f"     Fix: {e.get('corrective_action', 'N/A')}")
+            if e.get("issues"):
+                for issue in e["issues"][:3]:
+                    print(f"     ⚠  {issue}")
+            print()
+        print(f"{'='*70}")
+        print(ledger.format_constraints_for_synthesis() or "No constraints generated.")
+        print(f"{'='*70}\n")
+        return 0
 
     with ConcurrencyLock(LOCK_FILE, logger):
         if not args.count_pending and check_pause_state(logger):
@@ -1378,6 +1772,16 @@ def main():
 
         client = SupabaseClient(supabase_url, supabase_key)
         llm = MultiProviderLLM(env_vars, logger)
+        ledger = LessonsLedger(LESSONS_FILE, logger)
+
+        # Log lessons ledger status at startup
+        recent_lessons = ledger.load_recent()
+        if recent_lessons:
+            failures = sum(1 for l in recent_lessons if l.get("outcome") == "failure")
+            successes = sum(1 for l in recent_lessons if l.get("outcome") == "success")
+            logger.info(f"Learning Loop: Loaded {len(recent_lessons)} lessons ({successes} successes, {failures} failures) from ledger.")
+        else:
+            logger.info("Learning Loop: No previous lessons found. Starting fresh.")
 
         if args.count_pending:
             try:
@@ -1423,7 +1827,7 @@ def main():
         if args.idea_id:
             target_idea = cohort_ideas[0]
             memo = f"Direct execution targeted for Idea #{target_idea['id']} via --idea-id."
-            ok = process_selected_idea(target_idea, memo, client, llm, args.dry_run, logger)
+            ok = process_selected_idea(target_idea, memo, client, llm, ledger, args.dry_run, logger)
             return 0 if ok else 1
 
         # Otherwise, run cohort comparison and select the best candidate(s)
@@ -1442,6 +1846,7 @@ def main():
                 decision_memo=decision.rationale,
                 client=client,
                 llm=llm,
+                ledger=ledger,
                 dry_run=args.dry_run,
                 logger=logger,
             )
