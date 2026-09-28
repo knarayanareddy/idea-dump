@@ -1112,17 +1112,30 @@ def run_self_correction_loop(
         if current_verif.passed:
             break
 
-        logger.warning(f"Self-correction loop triggered (attempt {attempt}/{max_retries}) on error:\n{current_verif.error_log[:200]}")
+        # Collect existing source files so LLM has the full context to diagnose and fix
+        files_context = []
+        for p in sorted(sandbox_dir.rglob("*.py")):
+            try:
+                rel = p.relative_to(sandbox_dir)
+                content = p.read_text(encoding="utf-8")
+                files_context.append(f"### File: {rel}\n```python\n{content}\n```")
+            except Exception:
+                pass
+        context_str = "\n\n".join(files_context)
 
         prompt = f"""The following unit tests failed in an isolated Python prototype:
 Error Log:
 {current_verif.error_log}
 
-Please diagnose the failure and provide the corrected file contents.
-Respond in JSON with a 'files' map containing only the file(s) that need fixes:
-{{"files": {{"relative/path.py": "..."}}}}
+Current Source Code:
+{context_str}
+
+Please diagnose the failure and provide the complete corrected file contents for each file that needs fixes.
+Do not provide snippets or markdown explanations; provide the full runnable Python file contents.
+Respond strictly in JSON with a 'files' map containing the full file contents:
+{{"files": {{"relative/path.py": "complete valid python code..."}}}}
 """
-        correction_resp, provider = llm.complete(prompt, json_mode=True, timeout=30)
+        correction_resp, provider = llm.complete(prompt, json_mode=True, timeout=60)
         if correction_resp:
             try:
                 clean = re.sub(r"^```(?:json)?\s*", "", correction_resp.strip())
@@ -1130,6 +1143,14 @@ Respond in JSON with a 'files' map containing only the file(s) that need fixes:
                 parsed = json.loads(clean)
                 fixed_files = parsed.get("files", {})
                 for rel_path, content in fixed_files.items():
+                    # Validate that content is non-empty and valid python syntax
+                    try:
+                        import ast
+                        ast.parse(content)
+                    except SyntaxError as syn_err:
+                        logger.warning(f"Self-correction proposed invalid Python for {rel_path} ({syn_err}), skipping write.")
+                        continue
+
                     target = sandbox_dir / rel_path
                     target.parent.mkdir(parents=True, exist_ok=True)
                     target.write_text(content, encoding="utf-8")
