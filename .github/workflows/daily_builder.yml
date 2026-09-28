@@ -49,6 +49,8 @@ jobs:
           GH_PAT: ${{ secrets.GH_PAT }}
         run: |
           echo "$GH_PAT" | gh auth login --with-token
+          gh auth setup-git
+          git config --global url."https://x-access-token:${GH_PAT}@github.com/".insteadOf "https://github.com/"
           git config --global user.name "Autonomous Daily Builder"
           git config --global user.email "autonomous-builder@local.dev"
           gh auth status
