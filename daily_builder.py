@@ -1102,7 +1102,7 @@ def run_self_correction_loop(
     verification: VerificationResult,
     llm: MultiProviderLLM,
     logger: logging.Logger,
-    max_retries: int = 2,
+    max_retries: int = 4,
 ) -> VerificationResult:
     """
     Self-correct failing files by diagnosing traceback and re-testing.
@@ -1627,7 +1627,7 @@ def process_selected_idea(
         return False
 
     # 3. Prototype Code Synthesis with Multi-Attempt Adversarial Refinement Loop
-    max_attempts = 6
+    max_attempts = int(os.environ.get("MAX_BUILD_ATTEMPTS", "12"))
     approved = False
     quality_score = 0
     quality_reason = ""
