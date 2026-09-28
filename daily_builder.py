@@ -1037,22 +1037,46 @@ def execute_sandbox_verification(
             err = f"Syntax error in {py_file.relative_to(sandbox_dir)}: {compile_res.stderr.strip()}"
             return VerificationResult(False, 0, err, len(py_files))
 
-    # 2. Execute unit test discovery
-    test_res = subprocess.run(
-        [sys.executable, "-m", "unittest", "discover", "-s", "tests", "-p", "test_*.py", "-v"],
-        cwd=str(sandbox_dir),
-        capture_output=True,
-        text=True,
-        timeout=30,
-    )
+    # 2. Execute unit test discovery with pytest (primary) or unittest (fallback)
+    test_res = None
+    combined_out = ""
+    try:
+        test_res = subprocess.run(
+            [sys.executable, "-m", "pytest", "tests", "-v", "--tb=short"],
+            cwd=str(sandbox_dir),
+            capture_output=True,
+            text=True,
+            timeout=45,
+        )
+        combined_out = test_res.stdout + "\n" + test_res.stderr
+    except Exception:
+        test_res = None
 
-    combined_out = test_res.stdout + "\n" + test_res.stderr
+    # If pytest wasn't available or had an execution error, fall back to unittest discover
+    if test_res is None or test_res.returncode == 5 or "No module named pytest" in combined_out:
+        alt_res = subprocess.run(
+            [sys.executable, "-m", "unittest", "discover", "-s", "tests", "-p", "test_*.py", "-v"],
+            cwd=str(sandbox_dir),
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        # If unittest succeeded or found tests, use its output
+        if alt_res.returncode == 0 or ("Ran " in alt_res.stdout or "Ran " in alt_res.stderr):
+            test_res = alt_res
+            combined_out = alt_res.stdout + "\n" + alt_res.stderr
+        elif test_res is None:
+            test_res = alt_res
+            combined_out = alt_res.stdout + "\n" + alt_res.stderr
+
     if test_res.returncode != 0:
         err = f"Unit tests failed (exit code {test_res.returncode}):\n{combined_out.strip()}"
         return VerificationResult(False, 0, err, len(py_files))
 
-    # Parse test count: e.g. "Ran 7 tests in 0.002s"
-    count_match = re.search(r"Ran (\d+) tests? in", combined_out)
+    # Parse test count: e.g. "Ran 7 tests" or "5 passed"
+    count_match = re.search(r"(\d+)\s+passed", combined_out, re.IGNORECASE)
+    if not count_match:
+        count_match = re.search(r"Ran (\d+) tests?", combined_out, re.IGNORECASE)
     test_count = int(count_match.group(1)) if count_match else 1
 
     if test_count == 0:
@@ -1582,7 +1606,7 @@ def process_selected_idea(
         return False
 
     # 3. Prototype Code Synthesis with Multi-Attempt Adversarial Refinement Loop
-    max_attempts = 3
+    max_attempts = 6
     approved = False
     quality_score = 0
     quality_reason = ""
@@ -1738,6 +1762,17 @@ def _auto_install_deps(sandbox_dir: Path, logger: logging.Logger) -> None:
     Automatically install any missing Python or Node dependencies
     declared in requirements.txt or package.json within the sandbox.
     """
+    # Always ensure pytest is available in the sandbox environment
+    try:
+        subprocess.run(
+            [sys.executable, "-m", "pip", "install", "pytest", "--quiet"],
+            capture_output=True,
+            timeout=60,
+            cwd=str(sandbox_dir),
+        )
+    except Exception:
+        pass
+
     req_txt = sandbox_dir / "requirements.txt"
     if req_txt.exists():
         logger.info(f"Installing Python dependencies from {req_txt}...")

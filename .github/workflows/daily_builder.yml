@@ -55,6 +55,10 @@ jobs:
           git config --global user.email "autonomous-builder@local.dev"
           gh auth status
 
+      - name: Install Runner Dependencies
+        run: |
+          pip install --upgrade pip pytest requests supabase
+
       - name: Run Daily Builder Pipeline
         id: run_builder
         env:
