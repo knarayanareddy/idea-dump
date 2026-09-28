@@ -1,0 +1,101 @@
+name: Autonomous Overnight Spec Builder
+
+on:
+  workflow_dispatch:
+    inputs:
+      repos:
+        description: "Target GitHub repositories to build (comma-separated, e.g. knarayanareddy/project-one,knarayanareddy/project-two)"
+        type: string
+        required: true
+        default: ""
+      dry_run:
+        description: "Dry run (generate code locally, do not push to target repos)"
+        type: boolean
+        required: false
+        default: false
+  schedule:
+    # Runs nightly at 21:30 UTC (23:30 CEST)
+    - cron: '30 21 * * *'
+
+jobs:
+  overnight-build:
+    name: Execute Overnight Spec-Driven Builder
+    runs-on: ubuntu-latest
+    timeout-minutes: 360 # 6 hours of runner runway for overnight construction
+    permissions:
+      contents: write
+      pull-requests: write
+
+    steps:
+      - name: Checkout Idea Dump Repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Set up Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Authenticate GitHub CLI & Git
+        env:
+          GH_PAT: ${{ secrets.GH_PAT }}
+        run: |
+          echo "$GH_PAT" | gh auth login --with-token
+          gh auth setup-git
+          git config --global url."https://x-access-token:${GH_PAT}@github.com/".insteadOf "https://github.com/"
+          git config --global user.name "Autonomous Spec Builder"
+          git config --global user.email "autonomous-builder@local.dev"
+          gh auth status
+
+      - name: Install Builder Dependencies
+        run: |
+          pip install --upgrade pip pytest requests fastapi uvicorn httpx pydantic rich
+
+      - name: Run Spec-Driven Builder
+        id: run_builder
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT }}
+          GITHUB_TOKEN: ${{ secrets.GH_PAT }}
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          OPENROUTER_API_KEY_1: ${{ secrets.OPENROUTER_API_KEY_1 }}
+          OPENROUTER_API_KEY_2: ${{ secrets.OPENROUTER_API_KEY_2 }}
+          OPENROUTER_API_KEY_3: ${{ secrets.OPENROUTER_API_KEY_3 }}
+          OPENROUTER_API_KEY_4: ${{ secrets.OPENROUTER_API_KEY_4 }}
+          OPENROUTER_API_KEY_5: ${{ secrets.OPENROUTER_API_KEY_5 }}
+          OPENROUTER_API_KEY_6: ${{ secrets.OPENROUTER_API_KEY_6 }}
+          TYPESAFE_API_KEY: ${{ secrets.TYPESAFE_API_KEY }}
+          TARGET_REPOS: ${{ github.event.inputs.repos || vars.OVERNIGHT_TARGET_REPOS }}
+        run: |
+          set -o pipefail
+          EXTRA_ARGS=""
+          if [ "${{ github.event.inputs.dry_run }}" = "true" ]; then
+            EXTRA_ARGS="$EXTRA_ARGS --dry-run"
+          fi
+
+          TARGET_LIST="${{ github.event.inputs.repos }}"
+          if [ -z "$TARGET_LIST" ]; then
+            TARGET_LIST="$TARGET_REPOS"
+          fi
+
+          if [ -z "$TARGET_LIST" ]; then
+            echo "::error ::No target repositories specified! Set --repos in workflow_dispatch or configure OVERNIGHT_TARGET_REPOS repository variable."
+            exit 1
+          fi
+
+          echo "Starting Overnight Spec-Driven Builder for repositories: $TARGET_LIST"
+          python3 spec_builder.py --repos "$TARGET_LIST" $EXTRA_ARGS 2>&1 | tee overnight_build.log
+
+      - name: Notify Telegram on Result
+        if: always()
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          JOB_STATUS: ${{ job.status }}
+          REPO_TARGETS: ${{ github.event.inputs.repos || vars.OVERNIGHT_TARGET_REPOS }}
+          TRIGGER_NAME: ${{ github.event_name }}
+        run: |
+          python3 scripts/notify_telegram.py "Overnight Spec Builder" overnight_build.log || true
