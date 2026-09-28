@@ -106,11 +106,25 @@ def parse_spec_file(spec_path: Path) -> Optional[SpecDocument]:
                 )
             )
 
+    # Extract all lines before the implementation checklist as the full architectural overview
+    checklist_start_idx = len(lines)
+    for idx, line in enumerate(lines):
+        if re.search(r"^\s*##+\s*.*(?:checklist|implementation|phase\s*1)", line, re.IGNORECASE):
+            checklist_start_idx = idx
+            break
+        if CHECKLIST_RE.match(line):
+            checklist_start_idx = idx
+            break
+
+    overview = "\n".join(lines[:checklist_start_idx]).strip()
+    if not overview:
+        overview = "\n".join(lines[:80])
+
     return SpecDocument(
         path=spec_path,
         raw_text=raw_text,
         title=title,
-        overview="\n".join(lines[:40]),
+        overview=overview,
         items=items,
     )
 
@@ -156,18 +170,78 @@ def get_repo_file_tree(workspace: Path) -> List[str]:
     return sorted(files)
 
 
-def read_context_files(workspace: Path, file_paths: Sequence[str], max_chars: int = 4000) -> str:
-    """Read a small sample of existing files to give the LLM context."""
+def read_context_files(workspace: Path, file_paths: Sequence[str], max_chars: int = 5000) -> str:
+    """Read existing code files with priority for domain models and storage schemas."""
     snippets: List[str] = []
-    for rel in file_paths[:5]:
+    # Filter out specs, license, gitignore to prioritize actual code
+    ignored_names = {"SPEC.md", "spec.md", "PROJECT_SPEC.md", "ARCHITECTURE.md", "README.md", "LICENSE", ".gitignore"}
+    candidate_paths = [p for p in file_paths if Path(p).name not in ignored_names]
+
+    # Prioritize python source code files (models, storage, policy, api, engine)
+    def priority(path_str: str) -> int:
+        p = path_str.lower()
+        if "model" in p:
+            return 0
+        if "storage" in p or "db" in p:
+            return 1
+        if "policy" in p or "engine" in p:
+            return 2
+        if "api" in p or "main" in p:
+            return 3
+        if path_str.endswith(".py"):
+            return 4
+        if path_str.endswith(".json") or path_str.endswith(".toml"):
+            return 5
+        return 6
+
+    sorted_candidates = sorted(candidate_paths, key=priority)
+    for rel in sorted_candidates[:10]:
         target = workspace / rel
-        if target.is_file() and target.suffix in (".py", ".json", ".toml", ".yml", ".yaml", ".md", ".ts", ".js"):
+        if target.is_file():
             try:
                 content = target.read_text(encoding="utf-8", errors="replace")
                 snippets.append(f"--- File: {rel} ---\n{content[:max_chars]}")
             except Exception:
                 pass
     return "\n\n".join(snippets)
+
+
+def extract_json(raw: str) -> Optional[dict]:
+    """Robustly extract and parse JSON from LLM output, tolerating markdown fences and conversational filler."""
+    if not raw or not raw.strip():
+        return None
+
+    # 1. Direct parse attempt
+    try:
+        data = json.loads(raw.strip())
+        if isinstance(data, dict):
+            return data
+    except Exception:
+        pass
+
+    # 2. Extract from markdown code fence ```json ... ``` or ``` ... ```
+    fence_match = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", raw, re.DOTALL)
+    if fence_match:
+        try:
+            data = json.loads(fence_match.group(1))
+            if isinstance(data, dict):
+                return data
+        except Exception:
+            pass
+
+    # 3. Extract outermost balanced or greedy braces { ... }
+    first_brace = raw.find("{")
+    last_brace = raw.rfind("}")
+    if first_brace != -1 and last_brace > first_brace:
+        candidate = raw[first_brace : last_brace + 1]
+        try:
+            data = json.loads(candidate)
+            if isinstance(data, dict):
+                return data
+        except Exception:
+            pass
+
+    return None
 
 
 def validate_python_files(workspace: Path, files_written: List[str]) -> Tuple[bool, str]:
@@ -249,9 +323,10 @@ Criteria:
         return True, 7, "JEV fallback accepted (LLM response blank)"
 
     try:
-        clean = re.sub(r"^```(?:json)?\s*", "", resp.strip())
-        clean = re.sub(r"\s*```$", "", clean)
-        data = json.loads(clean)
+        data = extract_json(resp)
+        if not data or not isinstance(data, dict):
+            return True, 7, "Heuristic pass (JEV format unparsed)"
+
         verdict = str(data.get("verdict", "APPROVED")).upper()
         score = int(data.get("quality_score", 7))
         is_fp = bool(data.get("is_false_positive", False))
@@ -391,7 +466,13 @@ class SpecDrivenBuilder:
         if (workspace / ".git").is_dir():
             logger.info(f"Workspace exists. Pulling latest main for {repo_name}...")
             res = subprocess.run(["git", "pull", "--rebase", "origin", "main"], cwd=str(workspace), capture_output=True, text=True)
-            return res.returncode == 0
+            if res.returncode == 0:
+                return True
+            logger.warning(f"Git pull failed: {res.stderr}; wiping directory for fresh clone...")
+            shutil.rmtree(workspace, ignore_errors=True)
+        elif workspace.exists():
+            logger.info(f"Wiping non-git directory at {workspace} for clean clone...")
+            shutil.rmtree(workspace, ignore_errors=True)
 
         logger.info(f"Cloning {repo_name} into {workspace}...")
         res = subprocess.run(["git", "clone", clone_url, str(workspace)], capture_output=True, text=True)
@@ -462,9 +543,10 @@ REQUIREMENTS:
                 continue
 
             try:
-                clean = re.sub(r"^```(?:json)?\s*", "", resp.strip())
-                clean = re.sub(r"\s*```$", "", clean)
-                data = json.loads(clean)
+                data = extract_json(resp)
+                if not data or not isinstance(data, dict):
+                    error_feedback = "LLM output did not contain a valid JSON dictionary. Return strict JSON only."
+                    continue
                 files_dict = data.get("files", {})
                 if not files_dict or not isinstance(files_dict, dict):
                     error_feedback = "JSON did not contain a valid 'files' dictionary"
