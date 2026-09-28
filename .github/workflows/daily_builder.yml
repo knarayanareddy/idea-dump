@@ -13,8 +13,13 @@ on:
         type: string
         required: false
         default: "1"
+      cohort_size:
+        description: "Cohort size for comparative evaluation (default: 10)"
+        type: string
+        required: false
+        default: "10"
       idea_id:
-        description: "Specific Idea ID to build (leave blank for next pending idea)"
+        description: "Specific Idea ID to build (leave blank to run cohort evaluation)"
         type: string
         required: false
         default: ""
@@ -56,6 +61,9 @@ jobs:
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
           GH_TOKEN: ${{ secrets.GH_PAT }}
           GITHUB_TOKEN: ${{ secrets.GH_PAT }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          TYPESAFE_API_KEY: ${{ secrets.TYPESAFE_API_KEY }}
         run: |
           EXTRA_ARGS=""
           if [ "${{ github.event.inputs.dry_run }}" = "true" ]; then
@@ -64,10 +72,11 @@ jobs:
           if [ -n "${{ github.event.inputs.idea_id }}" ]; then
             EXTRA_ARGS="$EXTRA_ARGS --idea-id ${{ github.event.inputs.idea_id }}"
           fi
+          COHORT_SIZE="${{ github.event.inputs.cohort_size || '10' }}"
           LIMIT="${{ github.event.inputs.limit || '1' }}"
 
-          echo "Starting daily_builder with limit=$LIMIT, extra_args=$EXTRA_ARGS..."
-          python3 daily_builder.py --limit "$LIMIT" $EXTRA_ARGS 2>&1 | tee run.log
+          echo "Starting daily_builder with limit=$LIMIT, cohort_size=$COHORT_SIZE, extra_args=$EXTRA_ARGS..."
+          python3 daily_builder.py --limit "$LIMIT" --cohort-size "$COHORT_SIZE" $EXTRA_ARGS 2>&1 | tee run.log
 
       - name: Notify Telegram on Result
         if: always()
