@@ -543,7 +543,16 @@ def main():
     repos = [r.strip() for r in args.repos.split(",") if r.strip()]
 
     if not repos:
-        logger.error("No repositories specified! Provide --repos <repo1>,<repo2> or set TARGET_REPOS env.")
+        targets_file = Path("config/overnight_targets.json")
+        if targets_file.is_file():
+            try:
+                data = json.loads(targets_file.read_text(encoding="utf-8"))
+                repos = [r.strip() for r in data.get("repositories", []) if r.strip()]
+            except Exception as exc:
+                logger.warning(f"Failed to read config/overnight_targets.json: {exc}")
+
+    if not repos:
+        logger.error("No repositories specified! Provide --repos <repo1>,<repo2>, set TARGET_REPOS env, or configure config/overnight_targets.json.")
         sys.exit(1)
 
     builder = SpecDrivenBuilder(target_repos=repos, work_dir=Path(args.workspace), dry_run=args.dry_run)
