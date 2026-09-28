@@ -22,8 +22,12 @@ import os
 import re
 import shutil
 import subprocess
+import socket
 import sys
 import time
+
+# Ensure generous socket timeout for LLM generation (180s)
+socket.setdefaulttimeout(180)
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -562,6 +566,11 @@ REQUIREMENTS:
                     target_file.write_text(content, encoding="utf-8")
                     files_written.append(rel_clean)
                     diff_snippets.append(f"--- {rel_clean} ---\n{content[:1000]}")
+                    # Ensure package __init__.py exists if in a Python package subdirectory
+                    if rel_clean.endswith(".py") and target_file.parent != workspace:
+                        init_py = target_file.parent / "__init__.py"
+                        if not init_py.is_file():
+                            init_py.write_text("# Package initialized\n", encoding="utf-8")
 
                 logger.info(f"Wrote {len(files_written)} file(s): {', '.join(files_written)}")
 

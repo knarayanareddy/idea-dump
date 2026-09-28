@@ -37,8 +37,8 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-# Global socket timeout to prevent any network hangs
-socket.setdefaulttimeout(10)
+# Global socket timeout for LLM generation runway (180s)
+socket.setdefaulttimeout(180)
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -263,51 +263,52 @@ class MultiProviderLLM:
         timeout: int = 180,
     ) -> Tuple[Optional[str], str]:
         """Request completion from OpenRouter stealth/space-bunny-alpha with key rotation and Gemini fallback."""
-        # 1. Try OpenRouter keys pool on space-bunny-alpha
+        # 1. Try OpenRouter keys pool on space-bunny-alpha, falling back to gemini-2.5-flash on OpenRouter if needed
         if self.openrouter_keys:
-            model_name = "stealth/space-bunny-alpha"
-            for attempt in range(len(self.openrouter_keys)):
-                key = self.openrouter_keys[self.current_key_idx % len(self.openrouter_keys)]
-                key_tag = f"key-{self.current_key_idx + 1}/{len(self.openrouter_keys)}"
-                try:
-                    payload = {
-                        "model": model_name,
-                        "messages": [
-                            {"role": "system", "content": system or "You are an autonomous senior software engineer and architect."},
-                            {"role": "user", "content": prompt}
-                        ],
-                        "temperature": 0.2 if json_mode else 0.7,
-                    }
-                    req = urllib.request.Request(
-                        "https://openrouter.ai/api/v1/chat/completions",
-                        data=json.dumps(payload).encode("utf-8"),
-                        headers={
-                            "Authorization": f"Bearer {key}",
-                            "Content-Type": "application/json",
-                            "HTTP-Referer": "https://github.com/knarayanareddy/idea-dump",
-                            "X-Title": "IdeaDump Autonomous Builder",
-                        },
-                        method="POST",
-                    )
-                    with urllib.request.urlopen(req, timeout=timeout) as resp:
-                        data = json.loads(resp.read().decode("utf-8"))
-                        content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
-                        if content and content.strip():
-                            return content.strip(), f"openrouter/{model_name} [{key_tag}]"
-                except urllib.error.HTTPError as exc:
-                    self.logger.warning(f"OpenRouter space-bunny-alpha HTTP {exc.code} on {key_tag}; rotating to next account key")
-                    self.current_key_idx = (self.current_key_idx + 1) % len(self.openrouter_keys)
-                    time.sleep(1)
-                    continue
-                except Exception as exc:
-                    self.logger.warning(f"OpenRouter space-bunny-alpha error on {key_tag}: {exc}; rotating to next key")
-                    self.current_key_idx = (self.current_key_idx + 1) % len(self.openrouter_keys)
-                    time.sleep(1)
-                    continue
+            candidate_models = ["stealth/space-bunny-alpha", "google/gemini-2.5-flash"]
+            for model_name in candidate_models:
+                for attempt in range(len(self.openrouter_keys)):
+                    key = self.openrouter_keys[self.current_key_idx % len(self.openrouter_keys)]
+                    key_tag = f"key-{self.current_key_idx + 1}/{len(self.openrouter_keys)}"
+                    try:
+                        payload = {
+                            "model": model_name,
+                            "messages": [
+                                {"role": "system", "content": system or "You are an autonomous senior software engineer and architect."},
+                                {"role": "user", "content": prompt}
+                            ],
+                            "temperature": 0.2 if json_mode else 0.7,
+                        }
+                        req = urllib.request.Request(
+                            "https://openrouter.ai/api/v1/chat/completions",
+                            data=json.dumps(payload).encode("utf-8"),
+                            headers={
+                                "Authorization": f"Bearer {key}",
+                                "Content-Type": "application/json",
+                                "HTTP-Referer": "https://github.com/knarayanareddy/idea-dump",
+                                "X-Title": "IdeaDump Autonomous Builder",
+                            },
+                            method="POST",
+                        )
+                        with urllib.request.urlopen(req, timeout=timeout) as resp:
+                            data = json.loads(resp.read().decode("utf-8"))
+                            content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
+                            if content and content.strip():
+                                return content.strip(), f"openrouter/{model_name} [{key_tag}]"
+                    except urllib.error.HTTPError as exc:
+                        self.logger.warning(f"OpenRouter {model_name} HTTP {exc.code} on {key_tag}; rotating key")
+                        self.current_key_idx = (self.current_key_idx + 1) % len(self.openrouter_keys)
+                        time.sleep(1)
+                        continue
+                    except Exception as exc:
+                        self.logger.warning(f"OpenRouter {model_name} error on {key_tag}: {exc}; rotating key")
+                        self.current_key_idx = (self.current_key_idx + 1) % len(self.openrouter_keys)
+                        time.sleep(1)
+                        continue
 
-        # 2. Try Gemini Flash if key is present
+        # 2. Try native Gemini Flash if direct key is present
         if self.gemini_key:
-            for gemini_model in ["gemini-3.5-flash", "gemini-2.0-flash", "gemini-1.5-flash"]:
+            for gemini_model in ["gemini-2.5-flash", "gemini-2.0-flash", "gemini-1.5-flash"]:
                 try:
                     url = f"https://generativelanguage.googleapis.com/v1beta/models/{gemini_model}:generateContent"
                     headers = {
