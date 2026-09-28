@@ -190,9 +190,12 @@ def run_workspace_tests(workspace: Path, timeout: int = 90) -> Tuple[bool, str]:
         return True, "No tests defined yet"
 
     try:
+        env = dict(os.environ)
+        env["PYTHONPATH"] = str(workspace)
         proc = subprocess.run(
             [sys.executable, "-m", "pytest", "-v"],
             cwd=str(workspace),
+            env=env,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
@@ -371,14 +374,18 @@ class SpecDrivenBuilder:
     def prepare_workspace(self, repo_name: str, workspace: Path) -> bool:
         """Clone the repository or pull latest main."""
         workspace.parent.mkdir(parents=True, exist_ok=True)
-        clone_url = f"https://github.com/{repo_name}.git"
+        token = os.environ.get("GH_PAT") or os.environ.get("GH_TOKEN") or os.environ.get("GITHUB_TOKEN")
+        if token:
+            clone_url = f"https://x-access-token:{token}@github.com/{repo_name}.git"
+        else:
+            clone_url = f"https://github.com/{repo_name}.git"
 
         if (workspace / ".git").is_dir():
             logger.info(f"Workspace exists. Pulling latest main for {repo_name}...")
             res = subprocess.run(["git", "pull", "--rebase", "origin", "main"], cwd=str(workspace), capture_output=True, text=True)
             return res.returncode == 0
 
-        logger.info(f"Cloning {clone_url} into {workspace}...")
+        logger.info(f"Cloning {repo_name} into {workspace}...")
         res = subprocess.run(["git", "clone", clone_url, str(workspace)], capture_output=True, text=True)
         if res.returncode != 0:
             logger.error(f"Git clone error: {res.stderr}")
@@ -502,6 +509,10 @@ REQUIREMENTS:
     def git_commit_and_push(self, workspace: Path, commit_msg: str) -> bool:
         """Stage all changes, commit, and push directly to origin main."""
         try:
+            # Ensure local git identity is configured
+            subprocess.run(["git", "config", "user.name", "Autonomous Spec Builder"], cwd=str(workspace), check=False)
+            subprocess.run(["git", "config", "user.email", "autonomous-builder@local.dev"], cwd=str(workspace), check=False)
+
             subprocess.run(["git", "add", "."], cwd=str(workspace), check=True)
             # Check if there are staged changes
             status = subprocess.run(["git", "status", "--porcelain"], cwd=str(workspace), capture_output=True, text=True)

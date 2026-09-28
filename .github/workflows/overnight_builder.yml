@@ -53,7 +53,7 @@ jobs:
 
       - name: Install Builder Dependencies
         run: |
-          pip install --upgrade pip pytest requests fastapi uvicorn httpx pydantic rich
+          pip install --upgrade pip pytest requests fastapi uvicorn httpx pydantic rich pypdf jinja2 python-multipart pyyaml
 
       - name: Run Spec-Driven Builder
         id: run_builder
