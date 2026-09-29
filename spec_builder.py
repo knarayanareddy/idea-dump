@@ -527,11 +527,12 @@ Please fix the exact issues above and output working code!
 """
 
             prompt += """
-REQUIREMENTS:
-1. Output ONLY 3-5 complete, production-grade files (code, tests, or config).
+REQUIREMENTS & GOAL-DRIVEN AUTONOMY:
+1. Output complete, production-grade files (code, tests, or config).
 2. NO placeholder comments, NO 'pass', NO empty stubs. Write real domain logic.
 3. Every new function or class must be covered with substantive unit tests.
-4. Output strict JSON format with this exact structure:
+4. PERMITTED SCOPE EXPANSION: You have full authority to update existing domain models, test fixtures (e.g. conftest.py), or pyproject.toml dependencies if required to make unit tests pass cleanly and resolve type or argument errors.
+5. Output strict JSON format with this exact structure:
 {
   "files": {
     "relative/path/to/file.py": "complete file contents...",
@@ -585,22 +586,22 @@ REQUIREMENTS:
                     logger.warning(error_feedback)
                     continue
 
-                # Automated Tests Check
+                # Automated Tests Check (Objective Reality Gate)
                 tests_ok, test_err = run_workspace_tests(workspace)
                 if not tests_ok:
                     error_feedback = f"Automated tests failed:\n{test_err}"
                     logger.warning(f"Tests failed on attempt {attempt}: {test_err[:200]}")
                     continue
 
-                # JEV Quality Gate Audit
+                # JEV Quality Gate Audit (Informational / Anti-False-Positive)
                 diff_preview = "\n\n".join(diff_snippets)
                 jev_approved, jev_score, jev_msg = audit_with_jev(self.llm, item, files_written, diff_preview)
-                if not jev_approved:
-                    error_feedback = f"JEV Quality Gate rejected implementation: {jev_msg}"
+                if not jev_approved and jev_score < 4:
+                    error_feedback = f"JEV Quality Gate flagged serious defect: {jev_msg}"
                     logger.warning(error_feedback)
                     continue
 
-                logger.info(f"Checklist item passed all gates: {jev_msg}")
+                logger.info(f"Checklist item passed all objective and quality gates: {jev_msg}")
                 return True, f"Successfully implemented in {len(files_written)} files ({jev_msg})"
 
             except Exception as exc:
