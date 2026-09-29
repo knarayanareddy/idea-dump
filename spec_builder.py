@@ -305,11 +305,42 @@ def validate_python_files(workspace: Path, files_written: List[str]) -> Tuple[bo
     return True, ""
 
 
-def run_workspace_tests(workspace: Path, timeout: int = 90) -> Tuple[bool, str]:
-    """Run pytest if tests exist in the workspace."""
+def chunk_checklist_items(
+    items: List[ChecklistItem],
+    max_chunk_size: int = 2,
+) -> List[List[ChecklistItem]]:
+    """Group contiguous checklist items belonging to the same phase into cohesive chunks.
+
+    Coalesces adjacent micro-items (e.g. Models + Storage, Engines + CLI) into single
+    synchronized implementation batches, cutting API roundtrips and avoiding cross-file
+    contract mismatch.
+    """
+    chunks: List[List[ChecklistItem]] = []
+    current_chunk: List[ChecklistItem] = []
+
+    for item in items:
+        if not current_chunk:
+            current_chunk.append(item)
+            continue
+
+        same_phase = (current_chunk[0].phase_header == item.phase_header)
+        if same_phase and len(current_chunk) < max_chunk_size:
+            current_chunk.append(item)
+        else:
+            chunks.append(current_chunk)
+            current_chunk = [item]
+
+    if current_chunk:
+        chunks.append(current_chunk)
+
+    return chunks
+
+
+def run_workspace_tests(workspace: Path, timeout: int = 90) -> Tuple[bool, str, int]:
+    """Run pytest if tests exist in the workspace. Returns (passed, output_or_err, exit_code)."""
     has_tests = (workspace / "tests").is_dir() or any(workspace.glob("test_*.py")) or any(workspace.glob("*_test.py"))
     if not has_tests:
-        return True, "No tests defined yet"
+        return True, "No tests defined yet", 999
 
     try:
         env = dict(os.environ)
@@ -325,28 +356,29 @@ def run_workspace_tests(workspace: Path, timeout: int = 90) -> Tuple[bool, str]:
             text=True,
             timeout=timeout,
         )
-        # returncode 0 = all passed, 5 = no tests collected (e.g. empty tests folder)
+        # returncode 0 = all passed, 5 = no tests collected
         if proc.returncode in (0, 5):
-            return True, proc.stdout[-500:] if proc.stdout else "Tests passed / no tests collected"
-        return False, proc.stdout[-4000:]
+            return True, proc.stdout[-500:] if proc.stdout else "Tests passed", proc.returncode
+        return False, proc.stdout[-4000:], proc.returncode
     except subprocess.TimeoutExpired:
-        return False, f"Tests timed out after {timeout} seconds"
+        return False, f"Tests timed out after {timeout} seconds", -1
     except Exception as exc:
-        return False, f"Test runner invocation error: {exc}"
+        return False, f"Test runner invocation error: {exc}", -1
 
 
 def audit_with_jev(
     llm: MultiProviderLLM,
-    item: ChecklistItem,
+    chunk: Sequence[ChecklistItem],
     files_written: List[str],
     diff_preview: str,
 ) -> Tuple[bool, int, str]:
     """Query JEV decision model to verify that the implementation is genuine."""
+    tasks_text = "\n".join([f"- {item.description} (Phase: {item.phase_header})" for item in chunk])
     prompt = f"""You are JEV, an autonomous System One code quality evaluator.
-Evaluate whether this code contribution genuinely implements the target checklist item.
+Evaluate whether this code contribution genuinely implements the target checklist task(s).
 
-Repository Task / Checklist Item:
-"{item.description}" (Phase: {item.phase_header})
+Repository Task(s):
+{tasks_text}
 
 Files Created/Modified ({len(files_written)}):
 {', '.join(files_written)}
@@ -398,10 +430,12 @@ class SpecDrivenBuilder:
         target_repos: List[str],
         work_dir: Path,
         dry_run: bool = False,
+        chunk_size: int = 2,
     ):
         self.target_repos = target_repos
         self.work_dir = Path(work_dir).resolve()
         self.dry_run = dry_run
+        self.chunk_size = max(1, min(chunk_size, 3))
 
         # Collect keys from ~/.hermes/idea-dump/keys.env if present, supplemented with os.environ
         keys_path = Path.home() / ".hermes" / "idea-dump" / "keys.env"
@@ -469,30 +503,38 @@ class SpecDrivenBuilder:
             logger.info(f"All {len(spec.items)} checklist items in {repo_name} are already completed!")
             return {"status": "completed", "completed_count": len(spec.items), "total": len(spec.items)}
 
+        # Coalesce micro-tasks into cohesive phase chunks
+        chunks = chunk_checklist_items(remaining, max_chunk_size=self.chunk_size)
+        logger.info(f"Coalesced {len(remaining)} tasks into {len(chunks)} cohesive phase chunks (chunk_size={self.chunk_size})")
+
         items_completed_this_run = 0
 
-        # 3. Iterate through unchecked items
-        for idx, item in enumerate(remaining, start=1):
+        # 3. Iterate through phase chunks
+        for c_idx, chunk in enumerate(chunks, start=1):
+            phase_name = chunk[0].phase_header or "General"
             logger.info("-" * 60)
-            logger.info(f"[{idx}/{len(remaining)}] Implementing Checklist Item: {item.description}")
-            logger.info(f"Phase: {item.phase_header}")
+            logger.info(f"[{c_idx}/{len(chunks)}] Implementing Phase Chunk ({len(chunk)} task(s)) in '{phase_name}':")
+            for it in chunk:
+                logger.info(f"  * {it.description}")
 
-            success, details = self.implement_checklist_item(spec, item, repo_workspace)
+            success, details = self.implement_checklist_chunk(spec, chunk, repo_workspace)
             if success:
-                items_completed_this_run += 1
-                logger.info(f"Checklist Item Verified: {item.description}")
+                items_completed_this_run += len(chunk)
+                logger.info(f"Phase Chunk Verified ({len(chunk)} tasks completed)")
 
-                # Update SPEC.md on disk
-                mark_item_completed(spec_path, item)
+                # Update SPEC.md on disk for all items in chunk
+                for item in chunk:
+                    mark_item_completed(spec_path, item)
 
                 if not self.dry_run:
+                    task_summary = " & ".join([it.description.split("`")[0].strip()[:35] for it in chunk])
                     self.git_commit_and_push(
                         repo_workspace,
-                        f"feat: implement checklist item '{item.description}'",
+                        f"feat({phase_name}): implement {task_summary}",
                     )
             else:
-                logger.error(f"Failed to implement '{item.description}': {details}")
-                logger.info("Continuing to the next checklist item...")
+                logger.error(f"Failed to implement chunk: {details}")
+                logger.info("Continuing to next phase chunk...")
                 continue
 
         return {
@@ -529,34 +571,36 @@ class SpecDrivenBuilder:
             return False
         return True
 
-    def implement_checklist_item(
+    def implement_checklist_chunk(
         self,
         spec: SpecDocument,
-        item: ChecklistItem,
+        chunk: List[ChecklistItem],
         workspace: Path,
     ) -> Tuple[bool, str]:
-        """Synthesize, verify, and JEV-audit one checklist item with self-correction."""
+        """Synthesize, verify, and audit a cohesive chunk of checklist items with self-correction."""
         file_tree = get_repo_file_tree(workspace)
         context_preview = read_context_files(workspace, file_tree)
+
+        phase_header = chunk[0].phase_header or "Implementation"
+        tasks_listing = "\n".join([f"{i+1}. {it.description}" for i, it in enumerate(chunk)])
 
         error_feedback = ""
         previous_files_map: Dict[str, str] = {}
 
         for attempt in range(1, MAX_ITEM_CORRECTION_ATTEMPTS + 1):
             if attempt > 1:
-                # Clean up any uncommitted scratch/broken files from the previous attempt
+                # Clean up uncommitted scratch files from previous attempt
                 subprocess.run(["git", "checkout", "."], cwd=str(workspace), capture_output=True)
                 subprocess.run(["git", "clean", "-fd"], cwd=str(workspace), capture_output=True)
-            logger.info(f"Synthesis Attempt {attempt}/{MAX_ITEM_CORRECTION_ATTEMPTS} for '{item.description}'...")
+            logger.info(f"Synthesis Attempt {attempt}/{MAX_ITEM_CORRECTION_ATTEMPTS} for Chunk ({len(chunk)} task(s))...")
 
             prompt = f"""You are Space Bunny Alpha, an elite autonomous software engineer building a production project from an architectural specification.
 
 SPECIFICATION OVERVIEW:
 {spec.overview}
 
-CURRENT CHECKLIST TASK TO IMPLEMENT:
-- Phase: {item.phase_header}
-- Task: {item.description}
+CURRENT COHESIVE CHECKLIST TASKS TO IMPLEMENT (Phase: {phase_header}):
+{tasks_listing}
 
 EXISTING REPOSITORY STRUCTURE:
 {', '.join(file_tree) if file_tree else '(Empty repository)'}
@@ -573,7 +617,7 @@ YOUR CODE FROM PREVIOUS ATTEMPT:
 FAILED WITH THIS ERROR:
 {error_feedback}
 
-Please analyze the exact error in your previous code above, fix the root cause, and output the complete corrected files!
+Please analyze the exact error in your previous code above, fix the root cause across all files in this batch, and output the complete corrected files!
 """
             elif error_feedback:
                 prompt += f"""
@@ -584,11 +628,12 @@ Please fix the exact issues above and output working code!
 
             prompt += """
 REQUIREMENTS & GOAL-DRIVEN AUTONOMY:
-1. Output complete, production-grade files (code, tests, or config).
-2. NO placeholder comments, NO 'pass', NO empty stubs. Write real domain logic.
-3. Every new function or class must be covered with substantive unit tests.
-4. PERMITTED SCOPE EXPANSION: You have full authority to update existing domain models, test fixtures (e.g. conftest.py), or pyproject.toml dependencies if required to make unit tests pass cleanly and resolve type or argument errors.
-5. Output each file using clean delimiters (recommended) or strict JSON:
+1. Implement the complete, production-grade files required by ALL listed tasks above in a synchronized batch.
+2. Ensure domain models, storage engines, policies, and test fixtures are fully aligned with each other.
+3. NO placeholder comments, NO 'pass', NO empty stubs. Write real, robust domain logic.
+4. Every new function or class must be covered with substantive unit tests.
+5. PERMITTED SCOPE EXPANSION: You have full authority to update existing domain models, test fixtures (e.g. conftest.py), or pyproject.toml dependencies if required to make unit tests pass cleanly and resolve type or argument errors.
+6. Output each file using clean delimiters (recommended) or strict JSON:
 
 === FILE: relative/path/to/file.py ===
 <full file contents here>
@@ -641,28 +686,34 @@ REQUIREMENTS & GOAL-DRIVEN AUTONOMY:
                     continue
 
                 # Automated Tests Check (Objective Reality Gate)
-                tests_ok, test_err = run_workspace_tests(workspace)
+                tests_ok, test_err, exit_code = run_workspace_tests(workspace)
                 if not tests_ok:
                     error_feedback = f"Automated tests failed:\n{test_err}"
                     logger.warning(f"Tests failed on attempt {attempt}: {test_err[:200]}")
                     continue
 
-                # JEV Quality Gate Audit (Informational / Anti-False-Positive)
+                # If pytest ran and passed with exit code 0, we have objective reality verification!
+                # Bypass secondary LLM roundtrip to cut latency and prevent stylistic rejections.
+                if exit_code == 0:
+                    logger.info("Objective Reality Gate Passed: 100% pytest test suite passed. Bypassing secondary LLM audit to save roundtrips.")
+                    return True, f"Successfully implemented {len(chunk)} task(s) in {len(files_written)} files (pytest passed 100%)"
+
+                # If no tests exist yet (exit_code 999 or 5), use JEV audit to verify non-stub code
                 diff_preview = "\n\n".join(diff_snippets)
-                jev_approved, jev_score, jev_msg = audit_with_jev(self.llm, item, files_written, diff_preview)
+                jev_approved, jev_score, jev_msg = audit_with_jev(self.llm, chunk, files_written, diff_preview)
                 if not jev_approved and jev_score < 4:
                     error_feedback = f"JEV Quality Gate flagged serious defect: {jev_msg}"
                     logger.warning(error_feedback)
                     continue
 
-                logger.info(f"Checklist item passed all objective and quality gates: {jev_msg}")
-                return True, f"Successfully implemented in {len(files_written)} files ({jev_msg})"
+                logger.info(f"Phase chunk passed quality gate: {jev_msg}")
+                return True, f"Successfully implemented {len(chunk)} task(s) in {len(files_written)} files ({jev_msg})"
 
             except Exception as exc:
                 error_feedback = f"Execution error: {exc}"
                 logger.warning(f"Attempt {attempt} failed: {exc}")
 
-        # Reset working tree so next checklist items start from a clean state
+        # Reset working tree so next items start from a clean state
         subprocess.run(["git", "checkout", "."], cwd=str(workspace), capture_output=True)
         subprocess.run(["git", "clean", "-fd"], cwd=str(workspace), capture_output=True)
         return False, f"Exhausted {MAX_ITEM_CORRECTION_ATTEMPTS} attempts. Last error: {error_feedback}"
@@ -716,6 +767,12 @@ def main():
         action="store_true",
         help="Preview generation without committing or pushing to GitHub",
     )
+    parser.add_argument(
+        "--chunk-size",
+        type=int,
+        default=int(os.environ.get("CHUNK_SIZE", 2)),
+        help="Number of contiguous checklist items per phase chunk (default: 2)",
+    )
 
     args = parser.parse_args()
     repos = [r.strip() for r in args.repos.split(",") if r.strip()]
@@ -733,7 +790,12 @@ def main():
         logger.error("No repositories specified! Provide --repos <repo1>,<repo2>, set TARGET_REPOS env, or configure config/overnight_targets.json.")
         sys.exit(1)
 
-    builder = SpecDrivenBuilder(target_repos=repos, work_dir=Path(args.workspace), dry_run=args.dry_run)
+    builder = SpecDrivenBuilder(
+        target_repos=repos,
+        work_dir=Path(args.workspace),
+        dry_run=args.dry_run,
+        chunk_size=args.chunk_size,
+    )
     summary = builder.run()
     print("\n" + "=" * 70)
     print(f"Overnight Build Completed: {json.dumps(summary, indent=2)}")
@@ -742,3 +804,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+

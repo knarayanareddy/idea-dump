@@ -13,6 +13,11 @@ on:
         type: boolean
         required: false
         default: false
+      chunk_size:
+        description: "Number of contiguous checklist tasks to coalesce into each phase chunk (default: 2)"
+        type: string
+        required: false
+        default: "2"
   schedule:
     # Runs nightly at 21:30 UTC (23:30 CEST)
     - cron: '30 21 * * *'
@@ -74,6 +79,10 @@ jobs:
           EXTRA_ARGS=""
           if [ "${{ github.event.inputs.dry_run }}" = "true" ]; then
             EXTRA_ARGS="$EXTRA_ARGS --dry-run"
+          fi
+          CHUNK_VAL="${{ github.event.inputs.chunk_size }}"
+          if [ -n "$CHUNK_VAL" ]; then
+            EXTRA_ARGS="$EXTRA_ARGS --chunk-size $CHUNK_VAL"
           fi
 
           TARGET_LIST="${{ github.event.inputs.repos }}"
