@@ -217,7 +217,7 @@ def extract_json(raw: str) -> Optional[dict]:
 
     # 1. Direct parse attempt
     try:
-        data = json.loads(raw.strip())
+        data = json.loads(raw.strip(), strict=False)
         if isinstance(data, dict):
             return data
     except Exception:
@@ -227,7 +227,7 @@ def extract_json(raw: str) -> Optional[dict]:
     fence_match = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", raw, re.DOTALL)
     if fence_match:
         try:
-            data = json.loads(fence_match.group(1))
+            data = json.loads(fence_match.group(1), strict=False)
             if isinstance(data, dict):
                 return data
         except Exception:
@@ -239,13 +239,57 @@ def extract_json(raw: str) -> Optional[dict]:
     if first_brace != -1 and last_brace > first_brace:
         candidate = raw[first_brace : last_brace + 1]
         try:
-            data = json.loads(candidate)
+            data = json.loads(candidate, strict=False)
             if isinstance(data, dict):
                 return data
         except Exception:
             pass
 
     return None
+
+
+def extract_files_from_response(raw: str) -> Dict[str, str]:
+    """Robustly extract file paths and contents from LLM output across Delimiter, Markdown, and JSON formats."""
+    files_map: Dict[str, str] = {}
+    if not raw or not raw.strip():
+        return files_map
+
+    # 1. Primary: Delimiter pattern (=== FILE: path === ... === END_FILE ===)
+    delimiter_pattern = re.compile(
+        r"=== (?:FILE|file):\s*([^\n\r]+?)\s*===\s*\n([\s\S]*?)=== (?:END_FILE|end_file) ===",
+        re.MULTILINE
+    )
+    for path, content in delimiter_pattern.findall(raw):
+        clean_path = path.strip().strip("`").strip("'").strip('"').lstrip("/")
+        if clean_path and content.strip():
+            files_map[clean_path] = content.strip()
+
+    if files_map:
+        return files_map
+
+    # 2. Markdown headers: (### FILE: path or ## path followed by code fence)
+    md_pattern = re.compile(
+        r"(?:###|##)\s*(?:FILE:)?\s*`?([a-zA-Z0-9_\-./]+\.[a-zA-Z0-9]+)`?\s*\n```(?:python|json|yaml|yml|html|css|txt|toml)?\s*\n([\s\S]*?)```",
+        re.MULTILINE
+    )
+    for path, content in md_pattern.findall(raw):
+        clean_path = path.strip().lstrip("/")
+        if clean_path and content.strip():
+            files_map[clean_path] = content.strip()
+
+    if files_map:
+        return files_map
+
+    # 3. JSON dictionary: {"files": {"path": "content"}}
+    data = extract_json(raw)
+    if data and isinstance(data, dict):
+        files_dict = data.get("files", {})
+        if isinstance(files_dict, dict):
+            for k, v in files_dict.items():
+                if isinstance(v, str) and v.strip():
+                    files_map[k.strip().lstrip("/")] = v.strip()
+
+    return files_map
 
 
 def validate_python_files(workspace: Path, files_written: List[str]) -> Tuple[bool, str]:
@@ -496,6 +540,7 @@ class SpecDrivenBuilder:
         context_preview = read_context_files(workspace, file_tree)
 
         error_feedback = ""
+        previous_files_map: Dict[str, str] = {}
 
         for attempt in range(1, MAX_ITEM_CORRECTION_ATTEMPTS + 1):
             if attempt > 1:
@@ -519,7 +564,18 @@ EXISTING REPOSITORY STRUCTURE:
 EXISTING RELEVANT CODE CONTEXT:
 {context_preview}
 """
-            if error_feedback:
+            if error_feedback and previous_files_map:
+                prev_code_block = "\n\n".join([f"=== FILE: {p} ===\n{c[:3000]}\n=== END_FILE ===" for p, c in previous_files_map.items()])
+                prompt += f"""
+YOUR CODE FROM PREVIOUS ATTEMPT:
+{prev_code_block}
+
+FAILED WITH THIS ERROR:
+{error_feedback}
+
+Please analyze the exact error in your previous code above, fix the root cause, and output the complete corrected files!
+"""
+            elif error_feedback:
                 prompt += f"""
 PREVIOUS ATTEMPT FAILED WITH ERROR:
 {error_feedback}
@@ -532,19 +588,20 @@ REQUIREMENTS & GOAL-DRIVEN AUTONOMY:
 2. NO placeholder comments, NO 'pass', NO empty stubs. Write real domain logic.
 3. Every new function or class must be covered with substantive unit tests.
 4. PERMITTED SCOPE EXPANSION: You have full authority to update existing domain models, test fixtures (e.g. conftest.py), or pyproject.toml dependencies if required to make unit tests pass cleanly and resolve type or argument errors.
-5. Output strict JSON format with this exact structure:
-{
-  "files": {
-    "relative/path/to/file.py": "complete file contents...",
-    "tests/test_feature.py": "complete test contents..."
-  },
-  "summary": "Brief description of changes made"
-}
+5. Output each file using clean delimiters (recommended) or strict JSON:
+
+=== FILE: relative/path/to/file.py ===
+<full file contents here>
+=== END_FILE ===
+
+=== FILE: tests/test_feature.py ===
+<full test contents here>
+=== END_FILE ===
 """
             resp, provider = self.llm.complete(
                 prompt,
-                system="You are an elite autonomous developer. Respond in strict JSON only.",
-                json_mode=True,
+                system="You are an elite autonomous developer. Output production code using the specified === FILE: ... === delimiters or JSON.",
+                json_mode=False,
             )
 
             if not resp:
@@ -552,14 +609,11 @@ REQUIREMENTS & GOAL-DRIVEN AUTONOMY:
                 continue
 
             try:
-                data = extract_json(resp)
-                if not data or not isinstance(data, dict):
-                    error_feedback = "LLM output did not contain a valid JSON dictionary. Return strict JSON only."
+                files_dict = extract_files_from_response(resp)
+                if not files_dict:
+                    error_feedback = "Could not extract valid files from LLM output. Use '=== FILE: path === ... === END_FILE ===' or JSON."
                     continue
-                files_dict = data.get("files", {})
-                if not files_dict or not isinstance(files_dict, dict):
-                    error_feedback = "JSON did not contain a valid 'files' dictionary"
-                    continue
+                previous_files_map = dict(files_dict)
 
                 # Write files to workspace
                 files_written = []
