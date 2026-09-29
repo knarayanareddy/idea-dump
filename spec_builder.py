@@ -44,7 +44,7 @@ logging.basicConfig(
 logger = logging.getLogger("spec_builder")
 
 CHECKLIST_RE = re.compile(r"^(\s*[-*]\s*\[([ xX])\])\s+(.+)$")
-MAX_ITEM_CORRECTION_ATTEMPTS = 3
+MAX_ITEM_CORRECTION_ATTEMPTS = 6
 
 
 @dataclass
@@ -284,7 +284,7 @@ def run_workspace_tests(workspace: Path, timeout: int = 90) -> Tuple[bool, str]:
         # returncode 0 = all passed, 5 = no tests collected (e.g. empty tests folder)
         if proc.returncode in (0, 5):
             return True, proc.stdout[-500:] if proc.stdout else "Tests passed / no tests collected"
-        return False, proc.stdout[-1500:]
+        return False, proc.stdout[-4000:]
     except subprocess.TimeoutExpired:
         return False, f"Tests timed out after {timeout} seconds"
     except Exception as exc:
@@ -448,8 +448,8 @@ class SpecDrivenBuilder:
                     )
             else:
                 logger.error(f"Failed to implement '{item.description}': {details}")
-                # Continue to next item or stop depending on criticality
-                break
+                logger.info("Continuing to the next checklist item...")
+                continue
 
         return {
             "status": "in_progress" if len(spec.remaining_items) > 0 else "completed",
@@ -498,6 +498,10 @@ class SpecDrivenBuilder:
         error_feedback = ""
 
         for attempt in range(1, MAX_ITEM_CORRECTION_ATTEMPTS + 1):
+            if attempt > 1:
+                # Clean up any uncommitted scratch/broken files from the previous attempt
+                subprocess.run(["git", "checkout", "."], cwd=str(workspace), capture_output=True)
+                subprocess.run(["git", "clean", "-fd"], cwd=str(workspace), capture_output=True)
             logger.info(f"Synthesis Attempt {attempt}/{MAX_ITEM_CORRECTION_ATTEMPTS} for '{item.description}'...")
 
             prompt = f"""You are Space Bunny Alpha, an elite autonomous software engineer building a production project from an architectural specification.
@@ -603,6 +607,9 @@ REQUIREMENTS:
                 error_feedback = f"Execution error: {exc}"
                 logger.warning(f"Attempt {attempt} failed: {exc}")
 
+        # Reset working tree so next checklist items start from a clean state
+        subprocess.run(["git", "checkout", "."], cwd=str(workspace), capture_output=True)
+        subprocess.run(["git", "clean", "-fd"], cwd=str(workspace), capture_output=True)
         return False, f"Exhausted {MAX_ITEM_CORRECTION_ATTEMPTS} attempts. Last error: {error_feedback}"
 
     def git_commit_and_push(self, workspace: Path, commit_msg: str) -> bool:
